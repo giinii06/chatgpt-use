@@ -1,7 +1,7 @@
 # PowerShell installer for Windows. Run from PowerShell:
-#   irm https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.ps1 | iex
 $ErrorActionPreference = 'Stop'
-$repo = 'leeguooooo/chatgpt-use'
+$repo = 'giinii06/chatgpt-use'
 $release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
 $asset = $release.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc' -and $_.name -match '\.zip$' } | Select-Object -First 1
 if (-not $asset) { throw 'No Windows release asset found (expected x86_64-pc-windows-msvc.zip).' }

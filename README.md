@@ -265,7 +265,7 @@ model, project and timeout.
 
 **The skill** — `SKILL.md` follows the [Agent Skills](https://agentskills.io/specification) format,
 so the same file serves Claude Code, Codex and Pi (which also reads `~/.agents/skills/`):
-`npx skills add leeguooooo/chatgpt-use`.
+`npx skills add giinii06/chatgpt-use`.
 
 What has been checked, offline and without asking ChatGPT anything: Claude Code (`claude mcp list` →
 Connected) and Pi 1.0.1 (`pi mcp list` → connected, 4 tools) both start the server and complete the
@@ -516,7 +516,7 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
 Windows PowerShell users can install the latest Windows release with:
 
 ```powershell
-irm https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.ps1 | iex
 ```
 
 On Windows, the `bash` tool runs commands through PowerShell (`powershell.exe`),
@@ -524,7 +524,7 @@ and its persistent working directory/environment are retained between calls.
 The browser dependency (`chrome-use`) must also be installed and available on `PATH`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.sh | sh
 ```
 
 `chatgpt-use` **requires `chrome-use`** on `PATH`. If it's missing:

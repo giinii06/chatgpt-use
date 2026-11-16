@@ -1,10 +1,10 @@
 #!/bin/sh
 # chatgpt-use installer — downloads a prebuilt binary from GitHub Releases.
 # No npm, no token. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.sh | sh
 set -eu
 
-REPO="leeguooooo/chatgpt-use"
+REPO="giinii06/chatgpt-use"
 BIN="chatgpt-use"
 INSTALL_DIR="${CHATGPT_USE_INSTALL_DIR:-$HOME/.local/bin}"
 

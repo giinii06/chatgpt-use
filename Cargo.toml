@@ -4,7 +4,7 @@ version = "0.0.12"
 edition = "2021"
 description = "Turn your ChatGPT web subscription into a coding-agent backend — no API key, no Codex billing. Built on chrome-use."
 license = "MIT"
-repository = "https://github.com/leeguooooo/chatgpt-use"
+repository = "https://github.com/giinii06/chatgpt-use"
 
 [[bin]]
 name = "chatgpt-use"

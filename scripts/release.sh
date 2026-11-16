@@ -12,7 +12,7 @@ run_ok() {  # run_ok <run-id> [-R owner/repo]: wait until the run completes (gh 
 }
 V=${1:?usage: scripts/release.sh <version> [--dry-run]}
 DRY=${2:-}
-REPO=leeguooooo/chatgpt-use
+REPO=giinii06/chatgpt-use
 NAME=chatgpt-use
 MARKETPLACE=leeguooooo/plugins
 cd "$(dirname "$0")/.."

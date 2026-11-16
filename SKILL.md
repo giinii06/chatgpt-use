@@ -13,7 +13,7 @@ Codex-usage bucket.
 **Install / self-heal:** if `chatgpt-use` is missing, install from the GitHub Release, then retry:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.sh | sh
 ```
 
 Requires `chrome-use` on PATH (`curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh`)

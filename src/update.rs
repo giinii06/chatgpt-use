@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const NAME: &str = "chatgpt-use";
-pub const REPO: &str = "leeguooooo/chatgpt-use";
+pub const REPO: &str = "giinii06/chatgpt-use";
 pub const CHECK_INTERVAL_SECS: u64 = 86_400;
 /// The daily check must not slow a command down.
 pub const NOTICE_TIMEOUT_SECS: u64 = 2;
