@@ -796,39 +796,59 @@ const JS_COMPOSER_FINGERPRINT: &str = concat!(
 })()"#
 );
 
-/// Chips the composer renders for files it will send. Deliberately broad: the
-/// app has renamed these test ids before, and a missed chip must read as "not
-/// confirmed" (a refusal), never as "attached" (a silent send without them).
+/// Chips the composer renders for files it will send. The app wraps each chip
+/// in a `composer-attachment` element and an invisible `...-surface` sibling,
+/// so the surface is excluded and the chip must carry text or a thumbnail.
+/// A missed chip must read as "not confirmed" (a refusal), never as "attached"
+/// (a silent send without them).
 macro_rules! attachment_selector {
     () => {
-        r#"[data-testid*="attachment" i], [data-testid*="file-chip" i], [class*="attachment" i]"#
+        r#"[class*="composer-attachment" i]"#
     };
 }
 #[cfg(test)]
 const ATTACHMENT_SELECTOR: &str = attachment_selector!();
+
+/// JS: `__cguChips(form)` counts real chips, not the container or its
+/// invisible surface siblings.
+macro_rules! js_chips_helper {
+    () => {
+        concat!(
+            r#"
+  const __cguChips = (form) => [...form.querySelectorAll('"#,
+            attachment_selector!(),
+            r#"')]
+    .filter(e => !/surface/i.test(e.className || '') &&
+      ((e.innerText || '').trim() || e.querySelector('img'))).length;
+"#
+        )
+    };
+}
 
 const FILE_INPUT_SELECTOR: &str = "[data-cgu-file-input]";
 
 /// JS: stamp the composer form's file input, and count the chips already there.
 /// A stamped input is the only handle `chrome-use upload` needs; the stamp is
 /// cleared first so a stale one from a previous turn cannot be targeted.
+///
+/// The form holds several hidden inputs (image-only, video, and the generic
+/// one). Pick the generic input: an empty `accept` first, then a `multiple`
+/// one, and only then whatever is left.
 const JS_FILE_INPUT: &str = concat!(
     "(() => {",
     js_composer_helper!(),
+    js_chips_helper!(),
     r#"
   const c = __cguComposer();
   const form = (c && c.closest('form')) || document;
   for (const n of document.querySelectorAll('[data-cgu-file-input]')) {
     n.removeAttribute('data-cgu-file-input');
   }
-  const input = form.querySelector('input[type="file"]') ||
-    document.querySelector('input[type="file"]');
+  const inputs = [...form.querySelectorAll('input[type="file"]')];
+  const input = inputs.find(i => !i.accept) || inputs.find(i => i.multiple) || inputs[inputs.length - 1];
   if (!input) return JSON.stringify({ok: false, existing: 0});
   input.setAttribute('data-cgu-file-input', '1');
-  const chips = form.querySelectorAll('"#,
-    attachment_selector!(),
-    r#"');
-  return JSON.stringify({ok: true, existing: chips.length});
+  return JSON.stringify({ok: true, existing: __cguChips(form)});
 })()"#
 );
 
@@ -836,13 +856,11 @@ const JS_FILE_INPUT: &str = concat!(
 const JS_ATTACHMENT_CHIPS: &str = concat!(
     "(() => {",
     js_composer_helper!(),
+    js_chips_helper!(),
     r#"
   const c = __cguComposer();
   const form = (c && c.closest('form')) || document;
-  const chips = form.querySelectorAll('"#,
-    attachment_selector!(),
-    r#"');
-  return JSON.stringify({chips: chips.length});
+  return JSON.stringify({chips: __cguChips(form)});
 })()"#
 );
 
