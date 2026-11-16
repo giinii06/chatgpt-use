@@ -1,846 +1,150 @@
 # chatgpt-use
 
-> Turn your **ChatGPT web subscription** into a coding-agent backend — **no API key, no Codex billing.**
-> Built on [`chrome-use`](https://github.com/leeguooooo/chrome-use), same lineage as [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen) and [`cookie-use`](https://github.com/leeguooooo/cookie-use).
->
-> **Fork.** This repository is a fork of
-> [`leeguooooo/chatgpt-use`](https://github.com/leeguooooo/chatgpt-use).
+English | [한국어](README.ko.md)
 
-<p align="center"><em>🧪 Experimental · <strong>v0.0.2 released</strong>. Browser main line (ask · structured delegation · <code>--model pro</code> · handoff) is live-verified; install with the one-liner below.</em></p>
+Drive your **ChatGPT web subscription** as a coding-agent backend. No API key, no Codex billing.
+
+> Unofficial browser automation, not an OpenAI-supported API. It drives a logged-in chatgpt.com tab
+> through [`chrome-use`](https://github.com/leeguooooo/chrome-use).
+>
+> Fork of [`leeguooooo/chatgpt-use`](https://github.com/leeguooooo/chatgpt-use), maintained at
+> [`giinii06/chatgpt-use`](https://github.com/giinii06/chatgpt-use).
 
 ![chatgpt-use](assets/hero.png)
 
 Your Plus / Pro plan already includes a chat surface you've paid for. `chatgpt-use` drives that
-**logged-in web conversation** through `chrome-use` — exactly the way `chatgpt-imagegen` drives image
-generation — and wires it into your local machine. The result: a coding agent (Claude Code, Codex,
-anything) can hand work to ChatGPT, and ChatGPT can read and edit your project files.
+logged-in conversation into your local machine: an agent hands work to ChatGPT, which can read and
+edit your project files. Not the API, not the Codex bucket — quota you already bought.
 
-The web chat surface is **not the API** and **not the Codex-usage bucket**. So the work runs on quota
-you've *already bought* — that's the whole point.
+## Quick start
 
----
-
-## Why this exists
-
-| | API / `codex exec` | **chatgpt-use (web)** |
-|---|---|---|
-| Auth | `OPENAI_API_KEY` or Codex login | your normal browser login |
-| Billing | per-token API spend / Codex-usage limit | **your flat monthly subscription** |
-| File access | you build context plumbing | **`read_file` tool — no tunnel** |
-| Setup | keys, env, gateways | `chrome-use` + a logged-in tab |
-
-If you're already paying for ChatGPT Plus/Pro and *also* burning API credits or Codex-usage limits
-from your coding agent, this closes the gap: route the cheap-and-already-paid work to the browser.
-
----
-
-## Three modes
-
-`chatgpt-use` is one engine — a `chrome-use`-driven **channel** to the ChatGPT web conversation (send a
-message, wait for the reply, parse it) — exposed three ways depending on **who's the brain**.
-
-### Mode 1 · 副手 / Sidekick — `chatgpt-use ask`
-
-![sidekick](assets/mode1-sidekick.png)
-
-**Your harness stays the brain.** Claude Code / Codex keeps planning and calling its own tools, and
-delegates a single sub-task — reasoning, code generation, a review pass — to ChatGPT when it wants a
-second brain. One round trip, no tool loop.
+You need Chrome signed in to chatgpt.com on a Plus/Pro plan, and
+[`chrome-use`](https://github.com/leeguooooo/chrome-use) on `PATH`.
 
 ```bash
-# one-shot: pipe context in, get an answer back
-chatgpt-use ask "Review this diff for race conditions" --file src/server.rs
-
-# or feed it whatever you already gathered
-git diff | chatgpt-use ask "Explain what changed and what might break"
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.sh | sh
+chatgpt-use ask "Explain this failure and how to fix it" --file build.log
 ```
 
-- The **caller** decides what context to send — `chatgpt-use` just relays it and returns ChatGPT's text.
-- **stdin** is context when it is piped (it goes after any `--file`, before the prompt). By default
-  the first byte (or EOF) must arrive within 5 seconds and EOF within 60, so an agent harness that
-  leaves a pipe open cannot hang the run; past either deadline the ask fails as `not_submitted`
-  instead of being sent without its context. `--stdin` waits for stdin however long it takes,
-  `--no-stdin` never reads it. Over 512 KiB also fails before anything is sent.
-  **Changed in 0.0.8:** `ask` used to ignore stdin. A caller that leaves an unused pipe open, or
-  runs `ask` inside a `while read` loop (where it would now drain the loop's input), should pass
-  `--no-stdin`.
-- `--json` prints one envelope instead of text — `{"status":"completed","result":{"text":…},
-  "conversation_id":…,"request_id":…}` or a failure with `error` — using the statuses and exit
-  codes below. Without `--json` the reply is plain text and any failure exits 1.
-- ChatGPT does **not** touch your machine in this mode.
-- Borrows the web-driving practices proven in
-  [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen): profile auto-detection
-  (`relay` → logged-in profile), composer polling, rate-limit-dialog detection, in-page
-  authenticated `fetch`, and conversation filing under a ChatGPT **Project**.
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.ps1 | iex
+```
 
-#### Structured output — `ask --output-schema`
+Or from source: `cargo install --git https://github.com/giinii06/chatgpt-use`.
 
-For a caller that parses the answer (a PR-review service, a CI step), pass a JSON Schema. The
-reply is validated locally, and stdout carries **one JSON line**, whatever happened:
+## Choose a mode
+
+`chatgpt-use` is one engine — a channel to the ChatGPT web conversation — exposed three ways
+depending on who's the brain.
+
+| Mode | Command | Who thinks | Use it for |
+|---|---|---|---|
+| Sidekick | `chatgpt-use ask` | your agent | a second opinion, a review, a plan |
+| Brain | `chatgpt-use run` | ChatGPT | a task that needs local tools, in a loop |
+| Drop-in | `chatgpt-use serve` | Claude Code | ChatGPT as the model behind an Anthropic-compatible endpoint |
 
 ```bash
-chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.schema.json
+# Sidekick — one-shot, optional file context, no tools
+chatgpt-use ask "Which of these two migrations is safer?" --file a.sql --file b.sql
+
+# Structured delegation — ChatGPT returns a verdict packet
+chatgpt-use ask "Review this diff" --mode review --file change.patch --json
+chatgpt-use handoff plan.json --to codex          # dry-run unless --execute
+
+# Brain — ChatGPT drives read/write/bash locally until done
+chatgpt-use run "Add retries to the uploader and run the tests" --approve
+
+# Drop-in — Claude Code keeps its loop; ChatGPT answers
+chatgpt-use serve --port 8787
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
 
-| `status` | meaning | exit |
-|---|---|---|
-| `completed` | `result` is present and validated against your schema | 0 |
-| `schema_violation` | valid JSON, wrong shape; `errors[]` carries `{path, message}`, plus `raw` | 3 |
-| `unparseable` | no parseable JSON in the reply (prose, truncated output); `raw` has the text | 4 |
-| `incomplete` | the prompt was sent but no complete reply arrived | 5 |
-| `unavailable` | throttled, signed out, wedged session, or a blocking dialog (its text is quoted) | 6 |
-| `failed` | failed before anything was sent (e.g. a context file would not read) | 1 |
-| `schema_error` | your schema would not load or compile; nothing was sent | 8 |
-| `busy` | another run holds the ChatGPT window and you passed `--busy fail` | 7 |
-| `duplicate` | the `--request-id` already names a request that may have been sent | 9 |
-| `submission_unknown` | `resume`: no conversation on record to attach to; not resent | 10 |
-| `cancelled` | the request was cancelled, and that is confirmed | 11 |
-| `cancel_requested` | stop was pressed but not confirmed; it may still be generating | 12 |
+`ask` answers. `run` acts. `serve` plugs in. Shared flags: `--model`, `--profile`, `--session`,
+`--project`; `--model` takes `instant|medium|high|"extra high"|pro`.
 
-The same envelope comes from plain `ask --json`, with `result: {"text": …}` instead of a validated
-value; `schema_violation`, `unparseable` and `schema_error` only arise with a schema.
+## Use it from a coding agent
 
-A reply that was stopped or cut off at the length limit is `incomplete`, never `completed`. The
-conversation record marks such a turn as closed, just like a finished one, and only
-`finish_details` tells them apart. Failures carry `error: {kind, message, submitted}`. `submitted` is `no`, `yes` or `unknown`.
-`unknown` means Enter was pressed but no receipt appeared, so a retry could post the prompt
-twice. No failure is ever reported as `completed` with an empty result. A reply that fails
-validation is **not** repaired with a follow-up turn: that would be another paid turn you did not
-ask for, so the decision to retry stays with the caller. Schemas must be self-contained, because
-a remote `$ref` is not fetched.
-
-#### Request receipts — `--request-id`, `status`, `--busy`
-
-A caller that might lose track of a request (a timeout, a crash, a kill) should name it:
-
-```bash
-chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.schema.json \
-  --request-id pr-42-head-9f3c --busy fail
-chatgpt-use status pr-42-head-9f3c   # never touches the browser
-```
-
-- A receipt at `~/.chatgpt-use/requests/<id>.json` is written **before** anything is sent. It
-  moves to `submitted` once the prompt is on the server, picks up the `conversation_id` as soon
-  as ChatGPT assigns one, and records the outcome.
-- **An id is never sent twice** if its request may have reached ChatGPT; that returns
-  `duplicate`. The only id that may be reused is one whose receipt proves nothing was sent
-  (`failed` with `submitted: no`).
-- `status` reports `running` while the owning process is alive. If the owner died, it reports
-  `detached` when the prompt was on the server, and `submission_unknown` when it can't tell.
-  Neither of those is permission to resend.
-- `--busy fail` returns `busy` immediately instead of queueing behind another run of the shared
-  window. The default is to wait.
-- `cancel <id>` stops that request's generation. If the owner is alive, it is sent SIGTERM and
-  presses stop in its own tab, which only ever shows its own pinned conversation. If the owner is
-  gone, `cancel` attaches to the recorded conversation and stops that one. The possible results:
-  - `cancelled`: confirmed, either because nothing had been sent yet, or because the
-    conversation record shows the reply stopped (`finish_details.type: "interrupted"`);
-  - `cancel_requested`: stop was pressed but the record hasn't confirmed it;
-  - `already_finished`: the reply finished first;
-  - `unknown`.
-
-  With `--request-id`, SIGTERM or Ctrl-C does the same, and a second signal exits at once.
-- `resume <id>` picks up a request whose caller lost it. It waits for the reply on the server
-  record, without sending anything, and prints the same envelope (`--output-schema` works here
-  too). It refuses a request whose owner is still running (`busy`). A request with no recorded
-  conversation (sent, or maybe sent, before ChatGPT assigned one) is `submission_unknown`: there
-  is nothing to attach to, and it is never resent.
-
-### Mode 2 · 大脑 / Brain — `chatgpt-use run`
-
-![brain](assets/mode2-brain.png)
-
-**ChatGPT is the brain; your machine is the hands.** A local agent loop — the same shape as Codex or
-Claude Code — but the model is your web subscription:
-
-1. `chatgpt-use` seeds the conversation with a **system prompt that defines a tool protocol**.
-2. ChatGPT replies with a structured **tool call** (a JSON object; the parser scans the rendered
-   reply for it, so a bare one-liner or a code block both work).
-3. The local harness **executes that tool** (`read_file`, `write_file`, `bash`, `grep`, `list_dir`, …)
-   and feeds the observation back into the chat.
-4. Loop until ChatGPT declares the task done.
-
-```bash
-chatgpt-use run "Add a --json flag to the status command and update the tests"
-```
-
-**This is why goal "let ChatGPT read my files" needs no tunnel and no exposed file server.** File
-access *is* the `read_file` / `grep` tools: the local harness reads the bytes and hands them into the
-conversation. ChatGPT never reaches back to your machine — it just asks, and the hands obey. It also
-works on a **Free** ChatGPT plan, unlike `work`, whose custom MCP app needs a paid one.
-
-Every tool result becomes message text, so results are bounded: `read_file` returns a large file in
-windows of 600 lines (≤ 30 000 characters) with the offset to read on, and any other result is cut
-at 20 000 characters with a note on how to narrow it.
-
-#### Code review — `chatgpt-use review`
-
-A diff alone cannot show a bug; confirming one means reading the callers, definitions and tests
-around it. `review` hands ChatGPT the change since `--base` as a starting point and lets it choose
-what else to read:
-
-```bash
-chatgpt-use review                       # the branch + uncommitted work, against main
-chatgpt-use review --base origin/main --focus "the cancel path" --max-steps 30
-```
-
-It runs in a throwaway `git worktree` of HEAD with your uncommitted and untracked files copied in,
-with read-only tools only (`git_diff`, `grep`, windowed `read_file`, …; no shell), so it cannot
-change your checkout. The report lists
-verified issues with file:line, a failure scenario and a fix. Each tool round is one ChatGPT
-message; `--max-steps` (default 20) caps the cost. `--keep` leaves the worktree for a look.
-
-### Mode 3 · 替身 / Drop-in model — `chatgpt-use serve`
-
-![drop-in](assets/mode3-dropin.png)
-
-**Claude Code stays exactly as it is — its agent loop, its tools, its UX — but the model behind it is
-secretly ChatGPT.** `chatgpt-use serve` exposes a local **Anthropic-compatible endpoint**
-(`/v1/messages`, streaming). Point Claude Code at it:
-
-```bash
-chatgpt-use serve --port 8787 &
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=whatever claude
-```
-
-Now every model call Claude Code makes — the thing that *spends Anthropic model tokens* — is
-intercepted, translated into a prompt, driven through your ChatGPT web subscription, and translated
-back into Anthropic's response shape (**including `tool_use` blocks**, so Claude Code's own tools keep
-working). Claude Code never knows its brain was swapped.
-
-- **No model tokens.** Claude Code's loop runs locally and free; the tokens it would have billed are
-  served by your flat subscription instead.
-- Reuses Mode 2's **text tool-call protocol + parser** — but instead of running our own loop, it
-  re-encodes ChatGPT's tool calls as Anthropic `tool_use` blocks and hands them back to Claude Code,
-  which runs its own tools.
-- The most ambitious and most fragile mode (see caveats): Claude Code's prompts are large, tool-call
-  fidelity over a text protocol is imperfect, and the web surface rate-limits. **Experimental².**
-
-All three modes share one engine: **Mode 1** is Mode 2 with tools off; **Mode 3** is Mode 2's tool
-protocol re-dressed as an Anthropic API so an *existing* harness can wear ChatGPT as its model.
-
----
-
-## Use it from any agent
-
-One contract for every harness: the CLI's `--json` envelope, and the same envelope from a
-caller-facing MCP server. Any agent that can run a shell command can use the first; any MCP client
-can use the second.
-
-**From a shell** (works everywhere):
+Any agent that can run a shell command can use the CLI's `--json` envelope. Any MCP client can use
+`chatgpt-use agent-mcp`, which exposes `ask`, `status`, `resume` and `cancel` over stdio and returns
+the same envelope as `structuredContent`. It exposes no file or shell tools — that is
+`chatgpt-use mcp`, which ChatGPT calls.
 
 ```bash
 chatgpt-use ask --json --request-id review-42 "Review this diff" < change.patch
-chatgpt-use status review-42      # never touches the browser
-chatgpt-use resume review-42      # lost the call? wait for its reply without resending
+chatgpt-use status review-42     # never touches the browser
+chatgpt-use resume review-42     # wait for the reply without resending
 chatgpt-use cancel review-42
 ```
 
-**As an MCP server** — `chatgpt-use agent-mcp` speaks MCP over stdio and offers four tools, `ask`,
-`status`, `resume` and `cancel`, returning the same envelope as `structuredContent`. It exposes no
-file or shell tools (that is `chatgpt-use mcp`, which ChatGPT calls). One ask runs at a time; a
-second returns `busy` at once, and `status`/`cancel` answer while an ask runs. Cancelling one
-request stops only that request, never the server. While an ask runs it sends a progress
-notification every 15 s to clients that ask for them.
-
-A ChatGPT turn can take several minutes. Two limits apply, and both must allow it: the server's own
-`--timeout` per turn (default 300 s, or a tool call's `timeout_secs`), and the agent's timeout for
-a tool call. Raise the server's, then set the agent's a little higher, so the server always answers
-first with a proper `incomplete` envelope instead of the agent cutting the call off. For 15-minute
-turns:
+A ChatGPT turn can take minutes. Two timeouts must both allow it: the server's `--timeout` per turn
+(default 300 s) and the agent's tool-call timeout. Set the server's first, then the agent's a little
+higher, so the server answers with an `incomplete` envelope instead of the agent cutting the call.
 
 | Agent | Register | Tool-call timeout |
 |---|---|---|
-| Claude Code | `claude mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | set `MCP_TOOL_TIMEOUT=960000` (ms) if calls are cut off |
-| Codex | `codex mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | `tool_timeout_sec = 960` under `[mcp_servers.chatgpt-use]` in `~/.codex/config.toml` (default 300 s) |
-| Pi ≥ 0.99 | `pi mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | the 60 s default is reset by the server's progress notifications; or set `"timeout": 960` in `~/.pi/agent/mcp.json` |
+| Claude Code | `claude mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | `MCP_TOOL_TIMEOUT=960000` (ms) |
+| Codex | `codex mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | `tool_timeout_sec = 960` under `[mcp_servers.chatgpt-use]` |
+| Pi ≥ 0.99 | `pi mcp add chatgpt-use -- chatgpt-use agent-mcp --timeout 900` | progress notifications reset the 60 s default |
 
-With the default `--timeout 300`, raising only the agent's limit buys nothing: the turn still ends
-at 300 s.
+The skill: `npx skills add giinii06/chatgpt-use`.
 
-Pi gained built-in MCP in 0.99.0 ([docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/mcp.md));
-older Pi can use the CLI through the skill below. Defaults for every ask (`--model`, `--project`,
-`--timeout`, `--profile`, `--session`) can be passed after `agent-mcp`; a tool call may override
-model, project and timeout.
+## Other commands
 
-**The skill** — `SKILL.md` follows the [Agent Skills](https://agentskills.io/specification) format,
-so the same file serves Claude Code, Codex and Pi (which also reads `~/.agents/skills/`):
-`npx skills add giinii06/chatgpt-use`.
+| Command | What it does |
+|---|---|
+| `work "<task>"` | closed loop: ChatGPT does the task through its MCP connector and reports back |
+| `review` | code review that explores the repo in a throwaway worktree |
+| `mcp` | local MCP server exposing project tools to ChatGPT through a tunnel |
+| `init` | write `~/.chatgpt-use/auth.json` for `mcp` |
+| `refresh` | re-register the connector after restarting `mcp` |
+| `upgrade` | install the latest release and refresh the skill |
 
-What has been checked, offline and without asking ChatGPT anything: Claude Code (`claude mcp list` →
-Connected) and Pi 1.0.1 (`pi mcp list` → connected, 4 tools) both start the server and complete the
-MCP handshake; Codex 0.160 accepts the configuration, `tool_timeout_sec` included, but has no
-offline command that connects, so its handshake is unverified. A real ask through any of them has
-not been run here.
+`mcp` and `agent-mcp` point in opposite directions: `mcp` is called **by** ChatGPT over a public
+tunnel, `agent-mcp` is called **by** your agent over stdio.
 
 ## How it works
 
 ```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  chatgpt-use  (Rust CLI)                                         │
-  │                                                                  │
-  │   task ─▶ system prompt + tool protocol                          │
-  │              │                                                   │
-  │              ▼                                                   │
-  │      ┌───────────────┐   eval/send/poll   ┌──────────────────┐   │
-  │      │  agent loop   │ ─────────────────▶ │  chrome-use      │   │
-  │      │  + tool exec  │ ◀───────────────── │  (logged-in tab) │   │
-  │      └───────────────┘   parsed reply     └────────┬─────────┘   │
-  │              │                                     │             │
-  │     read_file/write_file/bash/grep         ChatGPT web chat      │
-  │              ▼                              (your subscription)  │
-  │        your project files                                       │
-  └─────────────────────────────────────────────────────────────────┘
+agent ──▶ chatgpt-use ──▶ chrome-use ──▶ logged-in chatgpt.com tab
+              ▲                                    │
+              └──── conversation record ◀──────────┘
 ```
 
-Everything page-side goes through `chrome-use eval <js>` (run JS in the page, get JSON back). Sending
-a prompt = fill `#prompt-textarea` + insert text + submit.
-
-That was once the whole design, and the parts that are gone are worth naming, because each was
-removed after it produced a wrong answer rather than an error:
-
-- **"Reply done" is no longer "the page stopped changing."** DOM quiescence is an inference, and it
-  was wrong in both directions — a mid-stream pause read as an ending, and a completed reply read as
-  a 240s timeout while the page had simply stopped rendering. The turn is finished when the server
-  says its newest public answer closed (`end_turn` on a finished final-channel message), which is a
-  fact. One message's `end_turn` is not enough: a multi-step turn closes each step, so the reply is
-  the newest answer with nothing newer still being written.
-- **The reply no longer comes from the page.** `innerText` is *rendered* markdown: `**bold**` arrives
-  as `bold`, and a ` ```json ` fence is not there at all — which is exactly why the tool-call parser
-  could never match one. Measured on one 600-word reply, scraping lost 87 characters of syntax.
-  Replies now come from the conversation record.
-- **Text is no longer typed.** A newline handed to `keyboard type` is an Enter, i.e. a *submit*, so
-  every multi-line prompt was being chopped at each `\n` and fired off as that many separate chat
-  messages. The model was answering fragments, which for a long time was misread as the model
-  refusing the protocol.
-
-## When the surface misbehaves
-
-ChatGPT's web app is not an API and does break — during one day of development its project pages
-rendered nothing but a "Try again" button account-wide, and its streaming wedged so the stop control
-never cleared. None of that is a reason for this tool to stop working, because in every one of those
-cases the *model* was fine and only the *page* was broken. So each failure has a way through rather
-than an error message:
-
-| when | instead of failing |
-|---|---|
-| the page never reports the turn finished | ask the server; take the reply from the conversation record |
-| the page wedges mid-generation and the composer locks | reload the pinned conversation to free it |
-| the project page won't render | start in a plain chat, then file the conversation into the project through the API |
-| the account is throttled | back off inside the deadline (20s / 45s / 90s) and keep asking the server — a turn that finished during the throttle is returned, not lost — then hold new runs back for a cooldown (see Request economy) |
-| the tab is closed or navigated away | reattach by conversation id; before the first turn has an id, start a fresh chat |
-
-The rule underneath all of them: **the record is authoritative, the page is a keyboard.** When the
-keyboard locks up, reset it; do not ask it what happened.
-
-## Request economy
-
-chatgpt.com throttles on **requests**, not messages — its own wording is "You're making requests too
-quickly. We've temporarily limited access to your conversations". So the number of HTTP calls per run
-decides how long the tool keeps working, and it is worth counting.
-
-A full navigation to `https://chatgpt.com/` costs **45 backend-api requests**: the SPA cold-boots and
-re-fetches every project's metadata and conversation list separately (18 of the 45, on an account
-with nine projects). The app's own client-side routes do the same jobs for far less.
-
-| action | requests |
-|---|---|
-| navigate to `chatgpt.com` | 45 |
-| the app's own "New chat" | 1 |
-| a sidebar link to an existing conversation | 9 |
-
-So connecting reuses the open tab instead of reloading it, reattaching clicks the sidebar link, the
-bearer token is fetched once per five minutes rather than per call, and a project's id is remembered
-in `~/.chatgpt-use/projects.json` rather than re-listing every project each run. Per-invocation cost
-went from roughly 90 requests to single digits.
-
-Once the throttle does trip, the cheapest request is the one not made:
-
-- **Account-wide cooldown.** A "Too many requests" hit writes `~/.chatgpt-use/throttle.json`, and
-  every run on the machine (`ask`, `run`, `serve`, a `serve` turn already connected) refuses with
-  `rate_limited` until it expires, without touching the browser. 5 min after the first hit, 15 and
-  then 30 min for repeats within the hour. `CHATGPT_USE_IGNORE_COOLDOWN=1` goes anyway.
-- **Pace warning.** Page loads and sent prompts are logged to the ledger. Past 15 page loads or 40
-  prompts in an hour, each new one prints a warning to stderr. It never blocks: ChatGPT publishes no
-  quota. Tune with `CHATGPT_USE_WARN_LOADS_PER_HOUR` / `CHATGPT_USE_WARN_SENDS_PER_HOUR` (`0` turns
-  a warning off).
-
----
-
-## Target architecture: dual-channel by model tier
-
-Live testing + studying three mature projects (see below) converged on one design rule:
-**don't make web ChatGPT role-play tools — route by what each model tier can actually do.**
-Full write-up: [`docs/architecture.html`](docs/architecture.html).
-
-Failure semantics (conversation identity, reconnect mid-generation, ambiguous submit, completion observation, cross-process contention), specified as browser-state → required outcome so other implementations can run them too: [`docs/failure-semantics-corpus.md`](docs/failure-semantics-corpus.md).
-
-![plan, then hand off](assets/planner-executor.png)
-
-```
-                         chatgpt-use (local daemon)
-                                    │
-        ┌───────────────────────────┼────────────────────────────┐
-        │                           │                            │
-   browser channel             MCP channel                  executor
-   (chrome-use)                (local server +              handoff
-        │                       public tunnel)                   │
-        ▼                           ▼                            ▼
-  GPT-5.5 **Pro**            GPT-5.5 Instant/Thinking     Codex / Claude Code
-  planner / reviewer         native tool-calling          run the plan locally
-  (NO Apps/MCP on Pro →      (real MCP tools, no
-   browser is the only       role-play wall)
-   way to reach Pro)
-```
-
-![two lanes by model](assets/two-lanes.png)
-
-- **Pro can't use Apps/MCP** (confirmed: OpenAI Help Center — *"Apps … are not available with Pro"*).
-  So Pro is reachable **only** through the browser channel, and is best used as a **planner/reviewer**
-  that returns a **structured delegation packet**, not as an autonomous file-editor.
-- **Regular GPT-5.5** *can* call native MCP tools — so genuine tool autonomy belongs on an **MCP
-  channel** (a local server exposed via a public tunnel, since ChatGPT runs in the cloud and can't
-  reach `localhost`), not on a faked browser text-protocol.
-- **Execution stays local.** The planner emits a typed packet
-  (`{goal, plan[], risks, tests, acceptance, do_not_do, verdict: proceed|revise|blocked}`); the
-  executor (Codex / Claude Code) only consumes packets — web ChatGPT never edits files directly.
-- **The value is rate-limit arbitrage:** your ChatGPT subscription quota is separate from the
-  Codex/API bucket, so a Pro plan's planning power becomes "free" executor-adjacent capacity.
-
-This is the **target**; the three modes below are the building blocks we're growing toward it.
-
-## Prior art we're borrowing from
-
-| Project | What we take |
-|---|---|
-| [`ChesterRa/cccc`](https://github.com/ChesterRa/cccc) (930★) | dual-transport (browser **push** + MCP **pull**); append-only `ledger.jsonl` + single-writer daemon + stateless frontends; actor-bound token (hash-stored); `bootstrap` recovery packet. Also the source of the hard "Pro can't use MCP connectors" finding. |
-| [`tt-a1i/hive`](https://github.com/tt-a1i/hive) (369★) | `<xml-system-reminder>` anchor tags placed at message **tail** (survive `/compact`); `PROTOCOL.md` fallback anchor; `tasks.md` task graph; session-resume by reading CLI rollout files. |
-| [`RPG-478/codex-chatgpt-bridge`](https://github.com/RPG-478/codex-chatgpt-bridge) | the planner-executor split done right: **delegation-packet** prompts (sender = a machine, not a human), **mode-typed** (`plan`/`review`/`debug`/`research`), strict `verdict: proceed\|revise\|blocked` schema with **fail-fast** parsing; same stable-reply detection we already use. |
-
----
-
-## The honest caveats
-
-This is a clever hack on a surface that was never meant to be an API. We're upfront about it:
-
-- **No native function-calling on the browser surface.** The web chat has no tool-call API (that's
-  API-only), so Mode 2 defines a **text protocol** in the system prompt.
-
-  This caveat used to say the model *refuses* the text protocol — that live testing across three
-  framings "all got refused", so we shouldn't fight it. **That was a misdiagnosis, and it's now
-  fixed.** The model was never refusing; two transport bugs meant it never got a fair hearing:
-
-  1. a newline typed into the composer is a **submit**, so the multi-line system prompt was shredded
-     into one chat message per line and ChatGPT only ever saw fragments of the protocol;
-  2. the reply parser only matched a literal ` ```json ` fence, which the **rendered** text we scrape
-     can never contain — so any tool call it *did* emit was misread as a plain-text final answer and
-     the loop exited on turn one.
-
-  With both fixed, turn 1 emits a tool call on its own (no priming nudge needed) and the loop runs to
-  a correct answer. Still: this is a text protocol over a chat surface, not native function-calling —
-  expect the occasional malformed turn. Native tool-calling remains better on the **MCP channel**
-  (regular GPT-5.5) when it's available to you.
-
-  Replies now come from the **conversation record**, not the rendered page, which removes the class
-  of bug above at the source. Rendered text is lossy: `**bold**` reaches `innerText` as `bold`, and a
-  ` ```json ` fence simply isn't there. Measured on one 600-word reply, scraping lost 87 characters
-  of markdown against the record. We ask the server (`GET /backend-api/conversation/<id>`, walking
-  `current_node`'s parent chain) and fall back to scraping only for the turn-one window before a
-  conversation id exists.
-- **Pro is browser-only, and the picker it lives in keeps moving.** **Pro** — the strongest planner —
-  cannot use Apps/MCP, so it's reachable only through the browser channel, and the closed loop
-  (`work`) must stay on a non-Pro level to keep its connector tools. `--model` is live-verified
-  again (2026-09-10), but it has broken twice now for the same reason, so it's worth saying what the
-  control actually is:
-
-  - The picker **button's text is not stable and is never matched on**. One account, three weeks:
-    `Instant`, then `5.6 SolLight`, then `6Pro` — plus `Thinking effort` while its own menu is open.
-    Those are `shortLabel`s from a model catalogue that changes with the line-up. We find the button
-    structurally instead: the one `aria-haspopup="menu"` button sharing the composer toolbar row with
-    the "+" button.
-  - The five effort levels are **no longer menu items**. They're a slider (`aria-valuenow` 0–4 →
-    instant / medium / high / extra high / pro) driven with arrow keys, so selection is verified on
-    the **index**, which is stable, never on the rendered name, which isn't. Model *family*
-    (`Latest`, `GPT-5.5`, …) is a separate axis and `--model` accepts those names too.
-  - If the control changes again, `--model` **errors out** instead of silently running on the account
-    default. That silent fallback is the dangerous failure: it makes `work` lose every connector tool
-    and then look like a model that just won't use its tools. Run without `--model` to accept
-    whatever the account is set to.
-- **A broken ChatGPT page shouldn't cost you the feature.** ChatGPT's *project* page has been observed
-  failing account-wide for hours — every project rendering only a "Try again" button — while the
-  backend API answered normally. `--project` no longer gives up when that happens: it starts the
-  conversation in a plain chat and files it into the project through the API once the conversation
-  exists (`PATCH /backend-api/conversation/<id>`). You lose only *being born* inside the project, not
-  the filing. Entering the project directly is still the preferred route and is tried first.
-- **Connector goes stale on `mcp` restart.** ChatGPT caches `tools/list`, so after you restart the
-  server it may not see the tools until a manual Refresh. `chatgpt-use refresh` automates that click
-  (live-verified against the settings UI); the closed loop is otherwise hands-off.
-- **Instant tool-calling is run-to-run flaky.** On the connector, ChatGPT-Instant sometimes hedges
-  instead of calling a tool. `work --retries` re-nudges on a thin report, and `--loop` lets a task span
-  many tool steps — but expect the occasional turn that needs a nudge.
-- **One window, one turn at a time.** The web surface is concurrency-1: a single logged-in tab, and an
-  account that rate-limits per account rather than per tab. Two things enforce that:
-
-  - Every run reuses the same chrome-use session, **`chatgpt-web`**, so there is one ChatGPT window
-    rather than one per invocation. Pass `--session` only when you deliberately want a separate tab.
-    Beyond tidiness: ChatGPT pushes toasts into *every* open chatgpt.com tab, so a second window can
-    let a document-wide read pick up a sibling tab's content.
-  - Runs queue across processes on an advisory lock at **`~/.chatgpt-web.lock`** — deliberately not
-    under `~/.chatgpt-use/`, because [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen)
-    drives the same surface and both tools must agree on one path. A waiter names who it is waiting
-    for: `waiting for chatgpt-imagegen (pid 4321) to finish with ChatGPT…`.
-
-  The lock covers a whole channel — connect through close — not one turn, so a multi-turn `run`/`work`
-  holds the surface for its duration. Per-turn was enough while each process opened its own tab; once
-  they share one window, `connect` itself is destructive, because it navigates that tab to a new chat.
-  (This README used to claim cross-process queueing already existed. It didn't: two processes sharing
-  a session interleaved inside one composer and merged their prompts.)
-- **It's slower than the API.** You're waiting on a browser rendering a chat. Fine for offloading;
-  not for tight latency loops.
-- **Mode 3 is the deep end.** A full chat harness's traffic squeezed through a browser chat box: slow,
-  occasionally wrong, and only as good as the tool-call translation. It's a proof-of-concept of "free
-  Claude Code", not a daily driver — yet.
-- **ToS — read this.** OpenAI's Terms prohibit programmatically extracting Output and bypassing rate
-  limits. So the honest positioning is **not** "web ChatGPT as a free API." It's: *"use your own
-  logged-in ChatGPT (esp. Pro) as a high-quality planner/reviewer in a local coding workflow; execution
-  stays with Codex / Claude Code / local tools."* Stay within your plan's terms; this is a personal
-  productivity bridge, not a resale/automation-at-scale tool.
-- **macOS first** (matches `chrome-use` / `cookie-use`); other platforms follow `chrome-use`.
-
----
-
-## Install
-
-> Distribution follows the GitHub-Release route (no npm, no token). Once the first binary ships:
-
-Windows PowerShell users can install the latest Windows release with:
-
-```powershell
-irm https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.ps1 | iex
-```
-
-On Windows, the `bash` tool runs commands through PowerShell (`powershell.exe`),
-and its persistent working directory/environment are retained between calls.
-The browser dependency (`chrome-use`) must also be installed and available on `PATH`.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/giinii06/chatgpt-use/main/install.sh | sh
-```
-
-`chatgpt-use` **requires `chrome-use`** on `PATH`. If it's missing:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh
-```
-
-Then make sure you have a Chrome profile logged in to chatgpt.com (or connect your live Chrome via
-`chrome-use extension connect`).
-
-### Upgrade
-
-```bash
-chatgpt-use upgrade            # install the latest release, refresh the skill
-chatgpt-use upgrade --check    # only report: chatgpt-use 0.0.4 -> 0.0.5
-chatgpt-use upgrade --json     # the same as JSON
-```
-
-`upgrade` reinstalls through the route you used — `install.sh` (or `install.ps1` on Windows) into the
-directory the binary is in, or `cargo install --git … --tag vX.Y.Z` for a cargo install — then refreshes
-each copy of the skill it finds: the Claude Code plugin (`claude plugin update`), git clones under
-`~/.agents/skills`, `~/.claude/skills` or `~/.codex/skills` (`git pull --ff-only`), and copied folders
-(it prints `npx skills update chatgpt-use`). Every other command checks for a newer release at most
-once a day and prints one line to stderr when there is one; `CHATGPT_USE_NO_UPDATE_CHECK=1`, the
-family-wide `USE_NO_UPDATE_CHECK=1` or `CI` turns that off. Nothing installs until you run `upgrade`.
-
-Maintainers release with `scripts/release.sh <version>` (`--dry-run` first): it tags, waits for the release binaries, then syncs the plugin marketplace.
-
----
-
-## Usage cheatsheet
-
-```bash
-# Closed loop — dispatch a task; ChatGPT DOES it on the project via its MCP
-# connector (read/build/test/logs) and reports back. Needs the connector
-# connected + an `mcp --profile full` server running; uses a non-Pro model.
-# Custom MCP apps need a PAID ChatGPT plan; on Free, use `run` / `review`.
-# Each message @-mentions the app (--connector, default chatgpt-use) so its
-# tools are offered; --model current skips the model picker.
-chatgpt-use work "<task>"
-#   --retries N    re-nudge if the report is thin / hedging (no real tool output). default 1
-#   --loop         multi-turn: ChatGPT ends each report STATUS: DONE|CONTINUE; we auto-
-#                  send "continue" until DONE — lets ONE task span many tool steps
-#   --max-turns N  cap on loop turns (default 8)
-#   --timeout S    per-turn wall-clock; work waits ≥1200s so a build/test can finish
-
-# Re-sync the connector after restarting the mcp server (re-runs tools/list).
-chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
-
-# Sidekick — plain question (harness is the brain)
-chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
-
-# Structured delegation — ChatGPT plans/reviews, returns a verdict packet
-chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]
-
-# Hand the packet to a local executor (dry-run unless --execute)
-chatgpt-use ask "<task>" --mode plan --json > plan.json
-chatgpt-use handoff plan.json --to codex|claude-code [--cwd <dir>] [--execute]
-
-# One-time setup — generate ~/.chatgpt-use/auth.json (mcp auto-loads it)
-chatgpt-use init
-
-# MCP channel — native tools for a regular GPT-5.5 (see MCP setup below)
-chatgpt-use mcp --port 8788 [--token <secret>] --cwd <project>
-#   tools (read-only): read_file/list_dir/grep + git_status/diff/log/show/blame + list_skills/read_skill
-#   tools (full only):  write_file/edit_file/bash
-#   --profile read-only (DEFAULT, safe to tunnel) | full (trusted/local only)
-#   --permission-mode safe (DEFAULT) | trusted | dangerous   (gates bash + secret-env filter)
-#   --bash-timeout S   per-command limit for the bash terminal (full profile; 0=unlimited)
-#   --skills-dir <dir> root for list_skills/read_skill (default ~/.claude/skills; "" disables)
-#   --auth-mode token (DEFAULT) | oauth                      (OAuth 2.1 + PKCE)
-#   paths are workspace-sandboxed: absolute / ".." / symlink-escapes are rejected
-
-# Full terminal for ChatGPT — let it run ANY command, like a shell (cwd + env persist):
-chatgpt-use mcp --port 8788 --token "$(openssl rand -hex 16)" --cwd <project> \
-  --profile full --permission-mode dangerous
-#   ⚠️ 'dangerous' = NO command gating. Anyone with the URL + token gets a real
-#      terminal on this machine. Keep the token secret; prefer NOT tunneling it.
-
-# Mode 2 — brain (experimental browser tool loop)
-chatgpt-use run "<task>" [--cwd <dir>] [--approve] [--max-steps N]
-# Mode 3 — drop-in model (Claude Code keeps its loop; ChatGPT is the model)
-chatgpt-use serve --port 8787   # then: ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
-
-# shared channel flags
-#   --model     instant | medium | high | "extra high" | pro   (Pro is browser-only)
-#   --profile   auto (default) | relay | "Profile 3"
-#   --session   reuse a chrome-use tab group   --project  file under a ChatGPT Project
-```
-
-### MCP channel setup (regular GPT-5.5)
-
-`chatgpt-use mcp` exposes the project tools (`read_file`/`write_file`/`list_dir`/`grep`/`bash`) as a
-JSON-RPC MCP server so a **regular** GPT-5.5 can call them natively (Pro can't use MCP). Since ChatGPT
-is in the cloud, expose the local server through a public HTTPS tunnel, then register it in
-**ChatGPT → Settings → Apps → Add custom connector**:
-
-```bash
-chatgpt-use mcp --port 8788 --token "$(openssl rand -hex 16)" --cwd /path/to/project
-cloudflared tunnel --url http://127.0.0.1:8788     # → paste the https URL into ChatGPT
-#   connector auth header:  Authorization: Bearer <your token>
-```
-
-⚠️ **Default is `--profile read-only`** (read_file/list_dir/grep, paths sandboxed to `--cwd`), so a
-tunneled server can't write files or run shell. Only pass `--profile full` on a **trusted, non-exposed**
-setup — there `bash`/`write_file` run without approval, so a leaked tunnel URL + token = shell access to
-`--cwd`. Always use a random `--token`, scope `--cwd`, and prefer ephemeral tunnels.
-**Full step-by-step + security notes: [`docs/mcp-setup.html`](docs/mcp-setup.html).**
-
-### Give ChatGPT a real terminal
-
-Under `--profile full`, the `bash` tool is a **persistent shell session**, not one-off commands:
-the working directory and exported environment **carry over between calls**, so ChatGPT can
-`cd build/ && cmake .. && make`, then `./run_tests` in the next call, then `export RUST_LOG=debug`
-and have it stick — exactly like a terminal. Each command is bounded by `--bash-timeout` (default
-300s; `0` = unlimited) so a hung command can't freeze the server, and a fresh session starts on each
-server restart.
-
-Command gating depends on `--permission-mode`:
-
-| Mode | What `bash` may run |
-|---|---|
-| `safe` (default) | blocks destructive (`rm -rf`…), network (`curl`/`ssh`…), and `$(…)`/backticks; strips secret-looking env |
-| `trusted` | blocks only catastrophic commands; still strips secret env |
-| `dangerous` | **no gating at all — a full, unrestricted terminal**; full env passed through |
-
-So to let ChatGPT "run any command like a terminal", run the server with
-`--profile full --permission-mode dangerous`. That is a remote shell on your machine for anyone
-holding the URL + token — use a strong random `--token`, scope `--cwd`, and **strongly prefer keeping
-it local / off any public tunnel**. The server prints a loud warning when started this way.
-
-> **Required one-time setup — turn off the per-call approval prompt.** ChatGPT pops an
-> *"Allow ChatGPT to use chatgpt-use? Deny / Allow once / Always allow"* dialog before **every**
-> connector tool call. An automated `work` run can't click it, so the call hangs and never reaches
-> the server (you'll see `work` stall with no output, and nothing in the server log). Fix it once:
-> in any chat, when the dialog appears click **Always allow → Always allow (without confirmation)**,
-> or set it under **Settings → Apps → chatgpt-use → permissions**. After that the closed loop is
-> truly hands-off. (This is *you* granting standing approval to an unrestricted terminal — deliberate
-> by design; the tool will not auto-click that safety prompt for you.)
->
-> **Diagnosing:** the server logs every request — `[mcp] → tools/call bash {…}` in
-> `~/.chatgpt-use/mcp.log` means a call genuinely arrived. If a `work` run "reports success" but no
-> such line appears, ChatGPT regurgitated cached/project-memory output without actually running the
-> tool — check the log (and, for side-effecting commands, the real filesystem) to be sure.
-
-### Let ChatGPT use your local agent skills
-
-If this machine has agent **skills** (the `~/.claude/skills/<name>/SKILL.md` ecosystem — browser
-automation, email, image generation, Feishu/Lark ops, …), ChatGPT can discover and run them through
-two connector tools:
-
-| Tool | What it does |
-|---|---|
-| `list_skills` | lists every skill on the machine (name + one-line description) |
-| `read_skill {name}` | returns that skill's full `SKILL.md` + a listing of its files |
-
-The flow is `list_skills → read_skill → bash`: ChatGPT discovers a skill, reads how to use it, then
-runs its CLI with the persistent `bash` terminal. **Live-verified across all three skill shapes** (the
-server log confirms the actual tool calls each time):
-
-| Skill shape | Example | What ChatGPT did (from the server log) |
-|---|---|---|
-| Prompt-only | `chinese-commit` | given a natural task with no tool names, it **auto-triggered** `list_skills → read_skill chinese-commit`, then produced a Conventional-Commits message following the skill |
-| CLI wrapper | `chrome-use` | `read_skill` then `bash chrome-use --help` |
-| Bundled script | `lark-slides` (its `xml_text_overlap_lint.py`) | `read_skill` → ran the script, hit a usage error, **ran `--help` to learn the flag, self-corrected**, then ran it with `--input`; output matched the locally-computed ground truth exactly |
-
-Two requirements:
-- **Profile / approval:** discovery tools are read-only (available in any profile); actually *running*
-  a skill needs `--profile full` (the `bash` tool) and the one-time "always allow" above.
-- **The skill's CLI must be on the server's `PATH`.** Skills are mostly thin wrappers over a CLI
-  (`chrome-use`, `mailbox`, `imagegen`, the `lark-*` tools). If the server can't find the binary you'll
-  see `command not found` — add its dir (e.g. `~/.local/bin`, `~/.bun/bin`) to the server's `PATH`
-  (in the launchd plist's `EnvironmentVariables`, or the shell that launches `mcp`).
-
-`--skills-dir <dir>` points discovery at a different root; `--skills-dir ""` disables it. Note: skills
-written purely for the Claude Code harness (those that say "use the Read/Edit tool") won't translate —
-but anything CLI-backed runs fine through `bash`.
-
-### Working long enough · loops · scheduled runs
-
-ChatGPT can sit quiet for minutes while a connector `bash` build/test runs. `work` is tuned for that:
-it waits up to `--timeout` (≥1200s) per turn and only gives up after ~3 min of *total* silence (no
-streaming, no active-tool indicator). So a single `work` turn already covers a multi-minute build.
-
-For tasks too big for one reply, **`--loop`** spans turns: ChatGPT ends each report with
-`STATUS: DONE` or `STATUS: CONTINUE`, and `work` auto-sends "continue" until it's DONE (or `--max-turns`):
-
-```bash
-chatgpt-use work "port every callsite of send() to send_with(), run cargo test after each, until green" \
-  --loop --max-turns 12 --retries 2
-```
-
-**Scheduled / recurring work** — drive `work` from `launchd` (macOS) or `cron`. The job needs the
-user's Chrome running and logged into ChatGPT (chrome-use relays through the live browser), and the
-`mcp` server + tunnel up. A ready template lives at [`examples/work-nightly.plist`](examples/work-nightly.plist):
-
-```bash
-# nightly "smoke" report at 03:00 — edit the task + path, then:
-cp examples/work-nightly.plist ~/Library/LaunchAgents/com.you.chatgpt-use-nightly.plist
-launchctl load ~/Library/LaunchAgents/com.you.chatgpt-use-nightly.plist
-# every result is appended to ~/.chatgpt-use/ledger.jsonl (kind:"work")
-```
-
-cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the test suite and summarize failures" >> ~/.chatgpt-use/nightly.log 2>&1`
-
----
-
-## Roadmap
-
-- [x] Design: three modes on one `chrome-use`-driven channel
-- [x] Channel core (send / poll / parse) — ported from `chatgpt-imagegen`, **live-verified**
-- [x] Tool protocol + parser + executor (`read_file`, `write_file`, `bash`, `grep`, `list_dir`) — unit-tested
-- [x] Mode 1 `ask` (one-shot, no tools) — **live-verified end-to-end**
-- [x] Mode 2 `run` agent loop + approval gate — implemented (see fidelity note ⬇)
-- [x] Mode 3 `serve` — Anthropic-compatible `/v1/messages` shim → Claude Code drop-in — implemented PoC
-- [x] `install.sh` + GitHub-Release workflow
-**Borrowed strengths → the main line (all live-verified unless noted):**
-- [x] **Structured delegation** — `ask --mode plan|review|debug|research` gathers `--file` context, sends a
-  typed machine-delegation packet, parses a strict `verdict: proceed|revise|blocked` packet (fail-fast).
-  **Live-verified** (from `codex-chatgpt-bridge`).
-- [x] **Read-only profile (default) + workspace sandbox** — `mcp --profile read-only|full`; paths reject
-  absolute/`..`/symlink-escape. Safe to tunnel by default. (from `coding-tools-mcp`)
-- [x] **More tools** — `git_status/diff/log/show/blame` (read-only) + `edit_file` (exact unique replace).
-- [x] **Permission modes + secret-env filtering** — `--permission-mode safe|trusted|dangerous` gates
-  destructive/network/substitution `bash`; secret-looking env vars stripped. (from `coding-tools-mcp`)
-- [x] **OAuth 2.1 + PKCE** — `mcp --auth-mode oauth` (discovery/register/authorize/token); full flow
-  verified locally. Token-in-URL stays the ChatGPT-verified default. (from `coding-tools-mcp`)
-- [x] **`init`** — `chatgpt-use init` writes `~/.chatgpt-use/auth.json`; `mcp` auto-loads it. (from `devspace`)
-- [x] **`--model` flag** — select the composer effort level (instant/medium/high/extra high/**pro**) or a model family (`Latest`, `GPT-5.5`, …). Rewritten 2026-09-10 for ChatGPT's slider-based picker; located structurally and verified on the slider index, because the button label drifts
-  on the browser channel. **Live-verified** (DOM-reverse-engineered: CDP-click the picker, JS-click the item).
-- [x] **Executor handoff** — pipe a delegation packet into a local agent. `--to` is **required** (never a
-  silent codex default); dry-run by default. **Live-verified** (dry-run + a real run). Optional side-bridge.
-- [x] **MCP channel** — local MCP JSON-RPC server exposing the tools to a *regular* GPT-5.5.
-  **Live-verified end-to-end**: registered as a custom connector (Settings → Apps, Developer mode,
-  No-Auth + token-in-URL) over a **named cloudflared tunnel**, then in an Instant chat ChatGPT called
-  `read_file` and returned a random probe string only our server could produce. Named-tunnel recipe (the
-  part that's fiddly): `--protocol http2` to dodge a local WARP+QUIC clash, and
-  `--config /dev/null --credentials-file <this-tunnel.json>` so the default tunnel's secret isn't reused.
-  Pro still can't use connectors — use Instant/Thinking.
-- [x] **Append-only ledger** at `~/.chatgpt-use/ledger.jsonl` (ask/delegate/handoff events). [ ] `<xml-system-reminder>` tail anchors + `PROTOCOL.md` fallback still pending (for the Mode-2 loop).
-- [x] **Release** — v0.0.1 binaries on GitHub Releases; `curl … install.sh | sh` works (verified on arm64 mac).
-- [x] **Closed-loop robustness** — `work` waits through multi-minute connector turns (chip-only
-  active-tool detection that never matches the reply's own prose; a hard idle ceiling so a finished
-  reply's DOM re-render can't wedge the wait; ≥1200s per-turn budget; heartbeat logs `msgs`/`len`),
-  retries a thin/hedging report (`--retries`), and spans many tool steps via a `STATUS: DONE|CONTINUE`
-  sentinel (`--loop`/`--max-turns`). Scheduling recipe + `examples/work-nightly.plist` for cron/launchd.
-  **Live-verified**: a single `work` turn returned the 3 real latest commit subjects + `Cargo.toml`
-  version `0.0.1`; `--loop` advanced turn 1 → "continue" → turn 2 against live ChatGPT-Instant.
-- [x] **Persistent terminal** — under `--profile full`, `bash` is a real shell session: cwd + exported
-  env carry over between calls, bounded by `--bash-timeout`. With `--permission-mode dangerous` it's an
-  unrestricted terminal for ChatGPT. **Live-verified end-to-end** (server log + on-disk side effect): a
-  hands-off `work` run made ChatGPT call `bash` to write a fresh random nonce to a file, confirmed by
-  `[mcp] → tools/call bash …` in the log AND the file appearing on disk with the exact nonce.
-- [x] **Local skill discovery** — `list_skills` + `read_skill` MCP tools expose the machine's
-  `~/.claude/skills` ecosystem; ChatGPT discovers a skill, reads its `SKILL.md`, then runs its CLI via
-  the `bash` terminal. **Live-verified across all three skill shapes** (server log): prompt-only
-  (`chinese-commit`, auto-triggered from a natural task), CLI wrapper (`chrome-use`), and bundled script
-  (`lark-slides` lint — ChatGPT even ran `--help` to self-correct the flags, output matched ground truth).
-  `--skills-dir` configures/disables the root. (Skill CLIs must be on the server's PATH.)
-- [x] **Request logging** — the MCP server logs every method to `mcp.log` (`→ tools/call <tool> <args>`),
-  so you can verify a connector call actually reached the server vs. ChatGPT regurgitating cached output.
-- [x] **Connector approval gotcha (documented)** — ChatGPT prompts *Allow once / Always allow* before each
-  connector tool call; the automated loop can't click it, so calls hang until you set the connector to
-  "always allow without confirmation" once. This was the real cause of the closed loop's earlier flakiness.
-- [x] **`refresh`** — `chatgpt-use refresh` re-syncs the connector after an `mcp` restart. **Live-verified**
-  (DOM-reverse-engineered: deep-link `#settings/Connectors` → click the `chatgpt-use` connector → click
-  its `Refresh` button, all via JS `.click()`); prints the controls it saw if it can't find one.
-
-**Kept as open research tracks (not abandoned):**
-- [x] Mode 2 `run` (autonomous browser tool loop) — the "model often refuses" verdict turned out to be two transport bugs, not model behaviour: typed newlines were submitting the system prompt one line at a time, and the reply parser matched a markdown fence that rendered text never contains. With both fixed the loop runs end-to-end (turn 1 calls a tool unprompted; the one-shot **priming nudge** is now a rarely-used fallback). Still experimental — it's a text protocol over a chat surface.
-- [ ] Mode 3 `serve` (Anthropic drop-in) — same wall; PoC only for now.
-- [ ] Optional UI shell (TUI / menubar) for live progress & approval.
-
-> **Status (honest):** Two channels are now live-verified end-to-end against real ChatGPT.
-> **Browser channel:** `ask`, structured delegation (`ask --mode plan` → a valid `DelegationPacket`),
-> `--model pro` (switches the level on the page), and `handoff` all work, filing under the project.
-> **MCP channel:** a regular GPT-5.5 (Instant) called our local `read_file` over a named cloudflared
-> tunnel and returned a random probe string — so **ChatGPT genuinely runs our tools**, no role-play.
-> The only thing still unsolved is **Modes 2 & 3** (making *web* ChatGPT autonomously call tools via a
-> text protocol) — that hits the role-play wall; the MCP channel is the right way to get native tools.
-
----
-
-## Credits
-
-Stands on the shoulders of [`chrome-use`](https://github.com/leeguooooo/chrome-use) (browser
-automation), [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen) (the web-driving
-playbook), and [`cookie-use`](https://github.com/leeguooooo/cookie-use) (the CLI-on-chrome-use model).
-
-Idea seeded by [@VincentLogic](https://x.com/VincentLogic/status/2066800292604026943).
-
-## License
-
-MIT
-
-<!-- use-family -->
-## The `*-use` family
-
-Small, composable CLIs that give an AI agent hands on one real thing. Same shape
-everywhere: `curl … install.sh | sh` to install, `npx skills add leeguooooo/<name>`
-to teach your agent, JSON on stdout.
-
-| Repo | Gives your agent |
-|---|---|
-| [chrome-use](https://github.com/leeguooooo/chrome-use) | A real browser — logged-in sessions, forms, scraping, screenshots |
-| [mail-use](https://github.com/leeguooooo/mail-use) | Email — read, search, send, triage across Gmail / QQ / 163 / any IMAP |
-| [iphone-use](https://github.com/leeguooooo/iphone-use) | A real iPhone — tap, type, screenshot, pull on-device data |
-| [wechat-use](https://github.com/leeguooooo/wechat-use) | WeChat on macOS — send messages, query contacts and history |
-| [discord-use](https://github.com/leeguooooo/discord-use) | Discord — messages, channels, forums, webhooks (REST-only, Rust) |
-| [cookie-use](https://github.com/leeguooooo/cookie-use) | Many logged-in accounts per site — capture, switch, apply sessions |
-| [profile-use](https://github.com/leeguooooo/profile-use) | Your personal profile, safely — fill signup / KYC / checkout forms |
-| [bitwarden-use](https://github.com/leeguooooo/bitwarden-use) | Bitwarden / Vaultwarden — headless passkey (FIDO2) login |
-| [computer-use](https://github.com/leeguooooo/computer-use) | The macOS desktop itself |
-| [pixcake-use](https://github.com/leeguooooo/pixcake-use) | Read-only PixCake probing — snapshot / diff / SQLite inspection |
-
-## Author
-
-Built by **郭立 (Guo Li / leeguoo)** — [leeguoo.com](https://leeguoo.com/about) · [GitHub](https://github.com/leeguooooo) · [X](https://x.com/leeguooooo) · more tools in the [*-use family](https://github.com/leeguooooo/plugins).
+Page-side work is all `chrome-use eval <js>`: fill `#prompt-textarea`, submit, poll.
+
+The turn is finished when the server says so, not when the page stops changing. `chatgpt-use` reads
+the conversation record (`/backend-api/conversation/<id>`) and walks the newest answer's parent
+chain. Done means the newest final-channel message is complete, `end_turn` is set, and nothing newer
+is still being written. DOM quiescence is an inference and was wrong in both directions: a mid-stream
+pause read as an ending, a finished reply read as a timeout. The reply text also comes from the
+record, not `innerText` — rendered markdown drops syntax (a 600-word reply lost 87 characters), and
+a hidden regenerated tail above the visible answer used to hold turns open forever.
+
+## Limitations and security
+
+- **Unofficial.** ChatGPT's web UI changes without notice; when it does, this breaks until patched.
+- **Long turns are slow.** A multi-minute turn is normal. Set both timeouts as described above.
+- **`run --approve`** gates each local tool call. Without it, ChatGPT acts on your project directly.
+- **`mcp` tunnels your files.** Default is read-only and sandboxed to `--cwd`. `--profile full` adds
+  writes and a shell; `--permission-mode dangerous` removes command gating entirely. Only expose that
+  on a trusted machine, always with a random `--token`.
+- **Terms of service.** This drives your own account; use it the way you would use the web app.
+
+## Documentation
+
+- [`docs/architecture.html`](docs/architecture.html) — the full design
+- [`docs/mcp-setup.html`](docs/mcp-setup.html) — connector setup, step by step
+- [`docs/failure-semantics-corpus.md`](docs/failure-semantics-corpus.md) — measured failure cases
+- [`SKILL.md`](SKILL.md) — the agent skill
+
+## Credits and license
+
+Stands on [`chrome-use`](https://github.com/leeguooooo/chrome-use) (browser automation),
+[`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen) (the web-driving playbook), and
+[`cookie-use`](https://github.com/leeguooooo/cookie-use) (the CLI-on-chrome-use model). Idea seeded
+by [@VincentLogic](https://x.com/VincentLogic/status/2066800292604026943).
+
+Forked from [`leeguooooo/chatgpt-use`](https://github.com/leeguooooo/chatgpt-use). MIT, Copyright
+(c) 2026 leeguooooo.
