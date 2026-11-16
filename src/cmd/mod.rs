@@ -3,6 +3,7 @@
 
 pub mod agent_mcp; // stdio MCP for calling agents: ask / status / resume / cancel
 pub mod ask; // Mode 1 — sidekick / structured delegation
+pub mod attach; // upload files with a message; a directory becomes a zip
 pub mod cancel; // stop an ask --request-id generation, confirmed from the record
 pub mod handoff; // executor handoff — feed a packet to Codex / Claude Code
 pub mod init; // one-time setup — generate ~/.chatgpt-use/auth.json

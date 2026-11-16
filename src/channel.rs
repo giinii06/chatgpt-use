@@ -796,6 +796,56 @@ const JS_COMPOSER_FINGERPRINT: &str = concat!(
 })()"#
 );
 
+/// Chips the composer renders for files it will send. Deliberately broad: the
+/// app has renamed these test ids before, and a missed chip must read as "not
+/// confirmed" (a refusal), never as "attached" (a silent send without them).
+macro_rules! attachment_selector {
+    () => {
+        r#"[data-testid*="attachment" i], [data-testid*="file-chip" i], [class*="attachment" i]"#
+    };
+}
+#[cfg(test)]
+const ATTACHMENT_SELECTOR: &str = attachment_selector!();
+
+const FILE_INPUT_SELECTOR: &str = "[data-cgu-file-input]";
+
+/// JS: stamp the composer form's file input, and count the chips already there.
+/// A stamped input is the only handle `chrome-use upload` needs; the stamp is
+/// cleared first so a stale one from a previous turn cannot be targeted.
+const JS_FILE_INPUT: &str = concat!(
+    "(() => {",
+    js_composer_helper!(),
+    r#"
+  const c = __cguComposer();
+  const form = (c && c.closest('form')) || document;
+  for (const n of document.querySelectorAll('[data-cgu-file-input]')) {
+    n.removeAttribute('data-cgu-file-input');
+  }
+  const input = form.querySelector('input[type="file"]') ||
+    document.querySelector('input[type="file"]');
+  if (!input) return JSON.stringify({ok: false, existing: 0});
+  input.setAttribute('data-cgu-file-input', '1');
+  const chips = form.querySelectorAll('"#,
+    attachment_selector!(),
+    r#"');
+  return JSON.stringify({ok: true, existing: chips.length});
+})()"#
+);
+
+/// JS: how many attachment chips the composer form holds now.
+const JS_ATTACHMENT_CHIPS: &str = concat!(
+    "(() => {",
+    js_composer_helper!(),
+    r#"
+  const c = __cguComposer();
+  const form = (c && c.closest('form')) || document;
+  const chips = form.querySelectorAll('"#,
+    attachment_selector!(),
+    r#"');
+  return JSON.stringify({chips: chips.length});
+})()"#
+);
+
 /// JS: insert `text` at the caret via `execCommand('insertText')`.
 ///
 /// This is deliberately NOT `keyboard type`. A "\n" typed into ProseMirror is an
@@ -1573,10 +1623,11 @@ impl Channel {
     fn fill_and_submit(
         &self,
         message: &str,
+        attachments: &[PathBuf],
         baseline_users: &UserTurns,
         budget: f64,
     ) -> std::result::Result<(), SubmitFailure> {
-        self.fill_composer(message, budget)
+        self.fill_composer(message, attachments, budget)
             .map_err(SubmitFailure::BeforeSubmit)?;
         self.submit(baseline_users, budget)
     }
@@ -1657,7 +1708,7 @@ impl Channel {
         Ok(())
     }
 
-    fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
+    fn fill_composer(&self, message: &str, attachments: &[PathBuf], budget: f64) -> Result<()> {
         // Never type while the PAGE still believes it is generating. ChatGPT
         // disables submission then, so Enter is silently swallowed and the turn
         // reports "never submitted".
@@ -1772,7 +1823,66 @@ impl Channel {
         // leeguooooo/chrome-use#301 does to chunked inserts.
         let (want_n, want_h) = composer_fingerprint(message);
         let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
-        check_fingerprint(got.as_ref(), want_n, want_h as u64)
+        check_fingerprint(got.as_ref(), want_n, want_h as u64)?;
+        // Attachments go in AFTER the fingerprint: a chip rendered inside the
+        // composer would otherwise change the hash this check just approved.
+        // The click puts focus back, so `submit`'s Enter still lands in the box.
+        if !attachments.is_empty() {
+            self.upload_attachments(attachments, budget)?;
+            ab_cmd(&self.ab, &["click", "[data-cgu-composer]"], &self.session, budget)
+                .context("refocusing the composer after attaching files")?;
+        }
+        Ok(())
+    }
+
+    /// Put `paths` in the composer's attachment slot and wait until the page
+    /// shows them. Fails closed: a prompt that was supposed to carry files is
+    /// not submitted without them.
+    fn upload_attachments(&self, paths: &[PathBuf], budget: f64) -> Result<()> {
+        let probe = ab_eval(&self.ab, JS_FILE_INPUT, &self.session, budget)
+            .context("looking for the composer's file input")?;
+        if !probe.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            bail!(
+                "the ChatGPT composer exposes no file input, so the attachment(s) cannot be \
+                 added: {}",
+                names(paths)
+            );
+        }
+        let existing = probe.get("existing").and_then(|n| n.as_u64()).unwrap_or(0);
+        if existing > 0 {
+            bail!(
+                "the ChatGPT composer already holds {existing} attachment(s), which would ride \
+                 along with this message; reload the chat and try again"
+            );
+        }
+
+        let args = upload_args(paths)?;
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        ab_cmd(&self.ab, &argv, &self.session, budget)
+            .context("uploading attachments through chrome-use")?;
+
+        // chrome-use confirms the input took the files, but the app may move
+        // them into its own chip list immediately. Ask the page, not the exit
+        // code, and give the upload a generous window before refusing.
+        let want = existing + paths.len() as u64;
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            let chips = ab_eval(&self.ab, JS_ATTACHMENT_CHIPS, &self.session, budget)
+                .ok()
+                .and_then(|v| v.get("chips").and_then(|n| n.as_u64()))
+                .unwrap_or(0);
+            if chips >= want {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                bail!(
+                    "uploaded {} but the composer never showed them; refusing to send the \
+                     prompt without its attachments",
+                    names(paths)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
     }
 
     /// Press Enter and return only once a new user turn proves it landed.
@@ -2034,6 +2144,13 @@ impl Channel {
         self.send_with(message, &SendOptions::default())
     }
 
+    /// Send one message with files attached to it. The paths are uploaded to
+    /// the composer before submit; a failure to place them refuses the turn
+    /// rather than sending the prompt alone.
+    pub fn send_attached(&mut self, message: &str, attachments: &[PathBuf]) -> Result<String> {
+        self.send_with_attachments(message, &SendOptions::default(), attachments)
+    }
+
     /// The conversation this channel is pinned to, once a turn has latched one.
     pub fn conversation_id(&self) -> Option<&str> {
         self.convo_id.as_deref()
@@ -2201,12 +2318,26 @@ impl Channel {
     /// A failure carries a [`ChannelError`] saying whether the prompt reached
     /// ChatGPT, so a caller knows if retrying could post it twice.
     pub fn send_with(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
+        self.send_with_attachments(message, sopts, &[])
+    }
+
+    fn send_with_attachments(
+        &mut self,
+        message: &str,
+        sopts: &SendOptions,
+        attachments: &[PathBuf],
+    ) -> Result<String> {
         self.submitted = false;
-        let result = self.send_turn(message, sopts);
+        let result = self.send_turn(message, sopts, attachments);
         result.map_err(|e| classify(e, self.submitted))
     }
 
-    fn send_turn(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
+    fn send_turn(
+        &mut self,
+        message: &str,
+        sopts: &SendOptions,
+        attachments: &[PathBuf],
+    ) -> Result<String> {
         // `serve` holds one channel for hours: a throttle hit on one turn must
         // also hold back the next, not only the next process.
         check_cooldown()?;
@@ -2275,7 +2406,7 @@ impl Channel {
         // Identity for every record read this turn: the latest user message in
         // the record must be this one, or its reply is somebody else's.
         self.sent_prompt = Some(message.to_string());
-        if let Err(first) = self.fill_and_submit(message, &baseline_users, remaining_secs()) {
+        if let Err(first) = self.fill_and_submit(message, attachments, &baseline_users, remaining_secs()) {
             // Fail closed on anything that might already be in flight.
             let SubmitFailure::BeforeSubmit(why) = first else {
                 return Err(first.into_error());
@@ -2298,7 +2429,7 @@ impl Channel {
             if self.convo_id.is_some() && user_turn_rose(&baseline_users, &users_now) {
                 eprintln!("the message had already been submitted; observing that turn");
             } else {
-                self.fill_and_submit(message, &users_now, remaining_secs())
+                self.fill_and_submit(message, attachments, &users_now, remaining_secs())
                     .map_err(SubmitFailure::into_error)
                     .context("resubmitting after reconnect")?;
                 // The poll loop below uses this baseline to tell "our page" from
@@ -3896,6 +4027,32 @@ fn pick_binary(names: &[&str], tiers: &[Vec<PathBuf>], suffixes: &[&str]) -> Opt
     None
 }
 
+/// The chrome-use argv for one upload. Pure, so its shape is testable without
+/// a browser: `upload <selector> <files...>`.
+fn upload_args(paths: &[PathBuf]) -> Result<Vec<String>> {
+    let mut args = vec!["upload".to_string(), FILE_INPUT_SELECTOR.to_string()];
+    for p in paths {
+        let s = p
+            .to_str()
+            .with_context(|| format!("attachment path is not valid UTF-8: {}", p.display()))?;
+        args.push(s.to_string());
+    }
+    Ok(args)
+}
+
+fn names(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .unwrap_or(p.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Run a chrome-use subcommand with optional profile; return stdout.
 /// Mirrors `_ab` in chatgpt-imagegen: `--profile <p>` precedes the subcommand;
 /// `--session <s>` trails everything.
@@ -4261,6 +4418,33 @@ mod tests {
     fn convo_drift_rejects_a_different_conversation() {
         let msg = convo_drift("abc", Some("xyz")).expect("must fail closed");
         assert!(msg.contains("abc") && msg.contains("xyz"), "{msg}");
+    }
+
+    #[test]
+    fn upload_argv_names_the_stamped_input_and_every_file() {
+        let paths = vec![
+            PathBuf::from("/tmp/a.zip"),
+            PathBuf::from("/tmp/b patch.patch"),
+        ];
+        let args = upload_args(&paths).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "upload",
+                "[data-cgu-file-input]",
+                "/tmp/a.zip",
+                "/tmp/b patch.patch"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_file_input_probe_stamps_what_the_upload_targets() {
+        assert!(JS_FILE_INPUT.contains("data-cgu-file-input"));
+        assert!(JS_FILE_INPUT.contains(r#"input[type="file"]"#));
+        assert!(JS_FILE_INPUT.contains("existing"));
+        assert!(JS_ATTACHMENT_CHIPS.contains("chips"));
+        assert!(ATTACHMENT_SELECTOR.contains("attachment"));
     }
 
     #[test]

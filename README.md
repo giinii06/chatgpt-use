@@ -48,6 +48,7 @@ depending on who's the brain.
 ```bash
 # Sidekick — one-shot, optional file context, no tools
 chatgpt-use ask "Which of these two migrations is safer?" --file a.sql --file b.sql
+chatgpt-use ask "Review this crate" --attach src/    # upload instead; a directory is zipped
 
 # Structured delegation — ChatGPT returns a verdict packet
 chatgpt-use ask "Review this diff" --mode review --file change.patch --json

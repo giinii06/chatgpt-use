@@ -47,6 +47,8 @@ pub struct AskInput {
     pub prompt: String,
     /// Context file paths, read by [`execute`].
     pub files: Vec<String>,
+    /// Files or directories uploaded as attachments, not inlined.
+    pub attach: Vec<String>,
     /// Context text already in hand (the CLI's stdin, an MCP argument).
     pub context: Option<String>,
     /// Ask for JSON matching this schema and validate it.
@@ -72,6 +74,9 @@ pub fn run(args: &AskArgs) -> Result<()> {
     }
     if args.output_schema.is_some() && args.mode != Mode::Ask {
         anyhow::bail!("--output-schema works with plain ask only, not --mode {:?}", args.mode);
+    }
+    if !args.attach.is_empty() && args.mode != Mode::Ask {
+        anyhow::bail!("--attach works with plain ask only, not --mode {:?}", args.mode);
     }
 
     let mode = if args.no_stdin {
@@ -106,6 +111,7 @@ pub fn run(args: &AskArgs) -> Result<()> {
             let input = AskInput {
                 prompt: args.prompt.clone(),
                 files: args.files.clone(),
+                attach: args.attach.clone(),
                 context: match read {
                     StdinRead::Text(t) => Some(t),
                     _ => None,
@@ -159,6 +165,12 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         Ok(m) => m,
         Err(e) => return tag(structured::failure(&e), input),
     };
+    // Before the browser: a missing path or an unzippable tree is the caller's
+    // error, and no page load should be spent discovering it.
+    let attachments = match crate::cmd::attach::prepare(&input.attach) {
+        Ok(a) => a,
+        Err(e) => return tag(structured::failure(&e), input),
+    };
     match claim_receipt(input.request_id.as_deref(), input.owner, input.owner_token.as_deref()) {
         Ok(path) => opts.receipt = path,
         Err(e) => return tag(structured::failure(&e), input),
@@ -170,7 +182,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
 
     let mut convo = None;
     let reply = Channel::connect(&opts).and_then(|mut channel| {
-        let reply = channel.send(&message);
+        let reply = channel.send_attached(&message, attachments.paths());
         convo = channel.conversation_id().map(str::to_string);
         channel.close();
         reply
@@ -190,6 +202,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         serde_json::json!({
             "prompt_chars": input.prompt.len(),
             "files": input.files.len(),
+            "attach": input.attach.len(),
             "context_chars": input.context.as_ref().map(|s| s.len()),
             "model": opts.model,
             "status": envelope["status"],
@@ -565,6 +578,7 @@ mod tests {
         AskInput {
             prompt: prompt.into(),
             files: vec![],
+            attach: vec![],
             context: None,
             schema: None,
             request_id: None,

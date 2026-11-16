@@ -203,6 +203,10 @@ pub struct AskArgs {
     /// Files whose contents are prepended as context (repeatable).
     #[arg(long = "file")]
     pub files: Vec<String>,
+    /// Files or directories to upload as attachments (repeatable). A directory
+    /// is zipped first. Unlike --file, the contents are not inlined.
+    #[arg(long = "attach", value_name = "PATH")]
+    pub attach: Vec<String>,
     /// Delegation mode: ask (plain text) | plan | review | debug | research.
     /// Non-ask modes send a typed delegation packet and parse a structured reply.
     #[arg(long, value_enum, default_value_t = crate::delegation::Mode::Ask)]
