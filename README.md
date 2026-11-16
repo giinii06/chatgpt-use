@@ -299,7 +299,9 @@ removed after it produced a wrong answer rather than an error:
 - **"Reply done" is no longer "the page stopped changing."** DOM quiescence is an inference, and it
   was wrong in both directions — a mid-stream pause read as an ending, and a completed reply read as
   a 240s timeout while the page had simply stopped rendering. The turn is finished when the server
-  says `end_turn`, which is a fact.
+  says its newest public answer closed (`end_turn` on a finished final-channel message), which is a
+  fact. One message's `end_turn` is not enough: a multi-step turn closes each step, so the reply is
+  the newest answer with nothing newer still being written.
 - **The reply no longer comes from the page.** `innerText` is *rendered* markdown: `**bold**` arrives
   as `bold`, and a ` ```json ` fence is not there at all — which is exactly why the tool-call parser
   could never match one. Measured on one 600-word reply, scraping lost 87 characters of syntax.

@@ -44,6 +44,8 @@ persisted; *pinned* = the implementation has recorded that id for the session.
 | 4.1 | Enter swallowed, composer already cleared, previous turn present | Observe | Must NOT return the previous turn's text | Scraping the previous turn as this turn's answer | pass (evidence = new user turn rendered, not "composer empty") |
 | 4.2 | Slow React clear after a successful submit | Observe | Must NOT count as a failed submit | Duplicate send | pass |
 | 4.3 | Reply streams for minutes with no DOM change | Observe | Heartbeat, no false timeout | Timing out on silence | pass |
+| 4.4 | Multi-step turn; an intermediate visible message closes before the final answer exists | Observe | Keep waiting; return only the final public answer | Returning the step's text as `completed` | pass (record: newest final-channel answer with `end_turn`, nothing newer still writing; DOM quiescence alone never completes) |
+| 4.5 | Assistant message renders only its screen-reader header ("ChatGPT 답변:ChatGPT") | Observe | Keep waiting, then `incomplete` | Returning the header as a reply | pass (`usable_reply` rejects chrome-only text) |
 
 ## 5. Cross-process contention (not in the original list; routine, not edge)
 

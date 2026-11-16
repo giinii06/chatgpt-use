@@ -662,6 +662,9 @@ const JS_STATE: &str = concat!(
     stop,
     tool_active,
     convo: cm ? cm[1] : "",
+    // ChatGPT's own chrome. A scrape that equals it is the page title, not a
+    // reply (see `usable_reply`).
+    title: (document.title || '').slice(0, 200),
     user_count: __cguUsers().length,
     assistant_count: a.length,
     limited: "#,
@@ -853,14 +856,20 @@ const __cguToken = async () => {
 };
 "#;
 
-/// JS: ask the SERVER whether this turn is finished, and what it said.
+/// JS: project the conversation record for the current turn.
 ///
-/// The DOM can only be inferred from: we watch it stop changing and call that an
-/// ending. That inference has been observed wrong in both directions — a
-/// mid-stream pause read as finished, and (live, this session) a completed reply
-/// read as a 240s timeout because the page had stopped rendering while the model
-/// worked perfectly. `end_turn` is not an inference; it is the server saying the
-/// turn closed.
+/// This probe used to decide completion itself: it walked `current_node`'s
+/// parent chain and returned the first assistant message with text, with
+/// `done` taken from that message's `end_turn`. On a multi-step turn the
+/// newest message is often an intermediate step, and a per-message `end_turn`
+/// says that STEP closed, not that the turn did — so the caller was told an
+/// interim message was the finished answer. Probed offline against fixtures:
+/// a visible progress message and a thinking step each came back `done: true`.
+///
+/// The walk stays here because it needs the payload; the DECISION moved to
+/// [`judge_record`], where it is pure and testable. Every field the judgement
+/// needs is projected, including `channel` and `status`, which is what tells a
+/// final answer from a commentary step.
 ///
 /// The mapping is a TREE — editing a prompt or regenerating forks it and the
 /// abandoned branches stay in the payload — so the live thread is `current_node`'s
@@ -892,33 +901,40 @@ fn js_server_final(convo_id: &str) -> String {
       }}
       return typeof c2.content === 'string' ? c2.content.trim() : '';
     }};
-    // chain is leaf -> root, so the first qualifying assistant message is the last one.
-    // Only messages AFTER the latest user turn belong to this turn: walking past
-    // it would find the previous turn's reply and report it as this one, done.
+    // chain is leaf -> root. Stop AT the latest user message: past it lies the
+    // previous turn's reply, which is closed and has text.
+    const nodes = [];
+    let user = null;
     for (const n of chain) {{
       const m = n.message;
-      if (!m || !m.author) continue;
-      if (m.author.role === 'user') break;
-      if (m.author.role !== 'assistant') continue;
-      // A stopped or length-capped turn is closed (end_turn true) but its text
-      // is partial; only finish_details tells it from a real finish. Report it
-      // even with no text, which is how a turn stopped early looks.
+      if (!m || !m.author) {{ nodes.push({{id: n.id || '', role: ''}}); continue; }}
+      if (m.author.role === 'user') {{ user = textOf(m.content); break; }}
+      const c2 = m.content || {{}};
+      const ct = c2.content_type || '';
       const fd = (m.metadata && m.metadata.finish_details) || {{}};
-      if (fd.type === 'interrupted' || fd.type === 'max_tokens') {{
-        return JSON.stringify({{ok: true, done: true, text: textOf(m.content), finish: fd.type,
-                                reason: fd.reason || null, async_status: null}});
-      }}
-      if (m.weight === 0) continue;
-      const ct = m.content && m.content.content_type;
-      if (ct === 'reasoning_recap' || ct === 'thoughts') continue;
-      const t = textOf(m.content);
-      if (!t) continue;
-      return JSON.stringify({{ok: true, done: m.end_turn === true, text: t,
-                              finish: fd.type || null, reason: fd.reason || null,
-                              async_status: j.async_status === undefined ? null : j.async_status}});
+      nodes.push({{
+        id: n.id || m.id || '',
+        role: m.author.role || '',
+        content_type: ct,
+        channel: m.channel || '',
+        recipient: m.recipient || '',
+        weight: typeof m.weight === 'number' ? m.weight : 1,
+        end_turn: m.end_turn === true,
+        status: m.status || '',
+        node_status: n.status || '',
+        is_complete: m.is_complete !== false,
+        hidden: !!(m.metadata && m.metadata.is_visually_hidden_from_conversation),
+        finish: fd.type || '',
+        reason: fd.reason || '',
+        // Only visible prose is carried: reasoning and tool payloads can be
+        // enormous and are never the answer.
+        text: (ct === '' || ct === 'text' || ct === 'multimodal_text') ? textOf(c2) : '',
+      }});
     }}
-    return JSON.stringify({{ok: true, done: false, text: '',
-                            async_status: j.async_status === undefined ? null : j.async_status}});
+    return JSON.stringify({{ok: true,
+      conversation_id: j.conversation_id || '',
+      user_text: user,
+      nodes: nodes}});
   }} catch (e) {{
     return JSON.stringify({{ok: false, error: String(e)}});
   }}
@@ -1222,11 +1238,14 @@ pub struct ChannelOptions {
 #[derive(Debug, Clone, Copy)]
 pub struct SendOptions {
     /// Polls (each ~2s) the visible reply text must stay UNCHANGED, with no
-    /// stop-button and no active-tool marker, before we treat it as final.
+    /// stop-button and no active-tool marker, before the record is asked. It
+    /// never closes a turn by itself; it only stops us hammering the record
+    /// while the page is still streaming.
     pub stable_needed: u32,
-    /// Safety net: give up waiting after this many consecutive polls (~2s each)
-    /// of total silence — text static, not streaming, no tool running. Only the
-    /// per-turn `timeout_secs` deadline applies otherwise.
+    /// The page has produced a new assistant turn but its text never goes
+    /// stable (collapsible tool disclosures keep mutating it). After this many
+    /// consecutive polls the record is asked anyway. The per-turn
+    /// `timeout_secs` deadline is still the only thing that ends the wait.
     pub idle_limit: u32,
 }
 
@@ -1274,6 +1293,10 @@ pub struct Channel {
     /// Whether the current turn's prompt is known to be on the server; decides
     /// how a failure of that turn is typed (see `classify`).
     submitted: bool,
+    /// The prompt the current turn submitted, so a record read can prove the
+    /// latest user turn in it is OURS and not an earlier question. `None` when
+    /// the channel attached to a conversation without sending (see `attach`).
+    sent_prompt: Option<String>,
     /// Receipt kept current as the turn progresses (see `receipt`).
     receipt: Option<PathBuf>,
     /// A ChatGPT app (connector) to @-mention into every message, so its tools
@@ -1478,6 +1501,7 @@ impl Channel {
             convo_id: None,
             pending_project: None,
             submitted: false,
+            sent_prompt: None,
             receipt: opts.receipt.clone(),
             connector: None,
             _surface: surface,
@@ -1802,33 +1826,33 @@ impl Channel {
         Ok(())
     }
 
-    /// The server's own answer for the pinned conversation: is the turn closed,
-    /// and what is the final assistant text. `None` when there is nothing to ask
-    /// about or the call failed — never an error, because this is a second
-    /// opinion, not the primary path.
-    fn server_final(&self, budget: f64) -> Option<ServerTurn> {
+    /// The conversation record for the pinned conversation, parsed. `None`
+    /// when there is nothing to ask about or the read failed — never an error,
+    /// because a missing record is "no proof", not a failed turn.
+    fn record(&self, budget: f64) -> Option<RecordTurn> {
         let id = self.convo_id.as_ref()?;
         let res = ab_eval(&self.ab, &js_server_final(id), &self.session, budget).ok()?;
         if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return None;
         }
-        let field = |k: &str| res.get(k).and_then(|v| v.as_str()).map(str::to_string);
-        Some(ServerTurn {
-            done: res.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
-            text: strip_private_markers(&field("text").unwrap_or_default()),
-            finish: field("finish"),
-            reason: field("reason"),
-        })
+        RecordTurn::from_json(&res)
     }
 
-    /// The server's verdict on this turn: its reply once it has properly
-    /// finished, `None` while it is open or the record is unreadable, and an
-    /// error when it closed cut off (see `judge_record`).
-    fn server_verdict(&self, budget: f64) -> Result<Option<String>> {
-        match self.server_final(budget) {
-            Some(turn) => judge_record(turn),
-            None => Ok(None),
+    /// What the record proves about this turn. The page is a hint; this is the
+    /// only source allowed to close a turn.
+    fn record_verdict(&self, budget: f64) -> Verdict {
+        let Some(turn) = self.record(budget) else {
+            return Verdict::Unreadable;
+        };
+        if !record_is_ours(
+            &turn,
+            self.convo_id.as_deref(),
+            self.sent_prompt.as_deref(),
+            self.connector.is_some(),
+        ) {
+            return Verdict::Unreadable;
         }
+        judge_record(&turn)
     }
 
     /// Move an existing conversation into a Project through the backend API.
@@ -2047,8 +2071,10 @@ impl Channel {
         };
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
         loop {
-            if let Some(text) = self.server_verdict(30.0)? {
-                return Ok(text);
+            match self.record_verdict(30.0) {
+                Verdict::Done(answer) => return Ok(answer.text),
+                Verdict::CutOff { kind, reason, chars } => return Err(kind.error(reason, chars)),
+                Verdict::Open | Verdict::Unreadable => {}
             }
             if Instant::now() >= deadline {
                 let why = "the reply has not finished, or the record could not be read";
@@ -2097,23 +2123,24 @@ impl Channel {
                 self.convo_id = current;
                 self.touch_receipt();
             }
-            if let Some(turn) = self.server_final(10.0) {
-                if turn.finish.as_deref() == Some("interrupted") {
+            match self.record_verdict(10.0) {
+                Verdict::CutOff { kind: CutOffKind::Interrupted, chars, .. } => {
                     return Err(ChannelError::new(
                         ErrorKind::Cancelled,
                         format!(
                             "cancelled: the conversation record confirms the reply stopped \
-                             ({} characters were generated)",
-                            turn.text.chars().count()
+                             ({chars} characters were generated)"
                         ),
                     )
                     .with_submitted(Submitted::Yes)
                     .into());
                 }
-                if let Some(text) = judge_record(turn)? {
+                Verdict::CutOff { kind, reason, chars } => return Err(kind.error(reason, chars)),
+                Verdict::Done(answer) => {
                     eprintln!("the reply finished before the stop took effect");
-                    return self.finish_turn(text, budget);
+                    return self.finish_turn(answer.text, budget);
                 }
+                Verdict::Open | Verdict::Unreadable => {}
             }
             if Instant::now() >= give_up {
                 return Err(ChannelError::new(
@@ -2133,10 +2160,13 @@ impl Channel {
     /// returned (nothing to cancel); one still open is reopened so its own
     /// stop button can be pressed.
     pub fn cancel_pinned(&mut self) -> Result<String> {
-        let open = match self.server_final(20.0) {
-            Some(turn) => !(turn.done || turn.finish.is_some()),
-            None => true,
-        };
+        // Only a turn the record proves closed (finished or cut off) has
+        // nothing left to cancel. An unreadable record means we cannot tell,
+        // and reopening to press stop is the safe side of that.
+        let open = !matches!(
+            self.record_verdict(20.0),
+            Verdict::Done(_) | Verdict::CutOff { .. }
+        );
         if open {
             self.reopen_pinned(60.0)?;
         }
@@ -2242,6 +2272,9 @@ impl Channel {
             crate::throttle::EVENT_SEND,
             serde_json::json!({ "conversation_id": self.convo_id, "chars": message.chars().count() }),
         );
+        // Identity for every record read this turn: the latest user message in
+        // the record must be this one, or its reply is somebody else's.
+        self.sent_prompt = Some(message.to_string());
         if let Err(first) = self.fill_and_submit(message, &baseline_users, remaining_secs()) {
             // Fail closed on anything that might already be in flight.
             let SubmitFailure::BeforeSubmit(why) = first else {
@@ -2291,22 +2324,15 @@ impl Channel {
                 .unwrap_or(baseline_count),
         );
 
-        // Poll until the stop button is gone AND a new assistant message count
-        // is larger than baseline.
+        // The page is a PROGRESS signal, never a verdict. It settles in phases —
+        // preamble, tool calls, final text — and a mid-turn gap looks exactly
+        // like an ending. What closes a turn is the record (`judge_record`);
+        // `Watch` only decides when the record is worth asking and whether the
+        // page has gone quiet enough to scrape on the turn-one path where no
+        // conversation id exists yet.
         let poll_interval = Duration::from_millis(2000);
         let mut last_atext = String::new();
-        let mut idle_count = 0u32;
-        // Stable-read: a reply (esp. one that calls connector tools) streams in
-        // phases — preamble, tool calls, final text — with brief moments where
-        // the stop button is absent mid-turn. Don't scrape until the assistant
-        // text has been UNCHANGED for a couple of polls AND the stop button is
-        // gone, so we capture the FINAL message, not a mid-turn partial.
-        let mut prev_stable = String::new();
-        let mut stable_polls = 0u32;
-        let stable_needed = sopts.stable_needed.max(1);
-        // After idle_limit polls (~2s each) with no progress at all we give up
-        // rather than hanging until the total timeout.
-        let idle_limit = sopts.idle_limit.max(1);
+        let mut watch = Watch::new(sopts, Instant::now());
 
         // Consecutive unreadable polls. ~3 misses (~6s) is well past a normal
         // navigation hiccup and reads as "the tab is gone".
@@ -2316,9 +2342,6 @@ impl Channel {
         // `unpinned_page_lost`).
         let mut unpinned_dips = 0u32;
 
-        // How often to ask the server instead of the page. Every 10th ~2s poll.
-        const SERVER_CHECK_EVERY: u64 = 10;
-        let mut polls: u64 = 0;
         // How many times we have backed off for the page's rate-limit dialog.
         let mut limited_waits: u32 = 0;
 
@@ -2330,20 +2353,20 @@ impl Channel {
 
         loop {
             if Instant::now() >= deadline {
-                // Before giving up, ask the server. The DOM going quiet is an
-                // inference; `end_turn` is not. Live this session: a turn that
-                // timed out here at 240s had in fact completed — the page had
-                // stopped rendering while the model worked fine. Reporting a
-                // timeout for an answer that exists is the worst outcome
-                // available, so spend one call to avoid it.
-                if let Some(text) = self.server_verdict(30.0)? {
-                    if !text.trim().is_empty() {
-                        eprintln!(
-                            "the page stopped updating, but the server says this turn finished \
-                             — taking the reply from the conversation record"
-                        );
-                        return self.finish_turn(text, remaining_secs());
+                // Before giving up, ask the record. The DOM going quiet is an
+                // inference; a closed turn is a fact. Live, a turn that timed
+                // out here at 240s had in fact completed — the page had stopped
+                // rendering while the model worked fine. Reporting a timeout
+                // for an answer that exists is the worst outcome available.
+                match self.record_verdict(30.0) {
+                    Verdict::Done(answer) => {
+                        log_completion("record", &answer, started.elapsed());
+                        return self.finish_turn(answer.text, remaining_secs());
                     }
+                    Verdict::CutOff { kind, reason, chars } => {
+                        return Err(kind.error(reason, chars));
+                    }
+                    Verdict::Open | Verdict::Unreadable => {}
                 }
                 // Say what is in the way if something visibly is. A plan or
                 // usage limit shows up as a dialog whose wording we cannot
@@ -2492,11 +2515,14 @@ impl Channel {
                 // Dismiss the dialog so the page is usable if it does recover.
                 let _ = ab_eval(&self.ab, JS_DISMISS_DIALOG, &self.session, remaining_secs());
                 nap(backoff);
-                if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
-                    if !text.trim().is_empty() {
+                match self.record_verdict(remaining_secs().min(30.0)) {
+                    Verdict::Done(answer) => {
                         eprintln!("the turn completed despite the throttle; taking it from the record");
-                        return self.finish_turn(text, remaining_secs());
+                        log_completion("record", &answer, started.elapsed());
+                        return self.finish_turn(answer.text, remaining_secs());
                     }
+                    Verdict::CutOff { kind, reason, chars } => return Err(kind.error(reason, chars)),
+                    Verdict::Open | Verdict::Unreadable => {}
                 }
                 continue;
             }
@@ -2513,27 +2539,11 @@ impl Channel {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let title = st.get("title").and_then(|v| v.as_str()).unwrap_or("");
 
             // Throttled heartbeat (~every 5s). Logs msg count + reply length so a
             // hang is diagnosable from the log alone (e.g. msgs=0 → no assistant
             // node yet; len frozen → settling; len climbing → still streaming).
-            // Periodic reconciliation. Cheap enough at this cadence (~every
-            // 20s) and it ends the wait the moment the server says the turn
-            // closed, instead of waiting out the settle heuristics.
-            polls += 1;
-            if polls.is_multiple_of(SERVER_CHECK_EVERY) && self.convo_id.is_some() {
-                if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
-                    if !text.trim().is_empty() {
-                        eprintln!(
-                            "[{:5}.0s] server reports the turn closed; taking the reply from the \
-                             conversation record",
-                            started.elapsed().as_secs()
-                        );
-                        return self.finish_turn(text, remaining_secs());
-                    }
-                }
-            }
-
             let elapsed = started.elapsed().as_secs();
             if elapsed >= last_beat + 5 {
                 last_beat = elapsed;
@@ -2551,86 +2561,81 @@ impl Channel {
                 last_atext = atext.clone();
             }
 
-            if stop || tool_active {
-                // Streaming, or a connector tool call is mid-flight — not settled.
-                idle_count = 0;
-                stable_polls = 0;
+            // Fold this poll in. `true` means the record is worth asking now.
+            // The page going quiet only makes the question cheaper; it can
+            // never answer it.
+            let due = watch.observe(
+                DomProgress {
+                    stop,
+                    tool_active,
+                    // A turn that never actually submitted (Enter swallowed, the
+                    // send-button fallback missed) leaves the PREVIOUS reply on
+                    // screen, static and stop-button-free. Requiring a new
+                    // assistant turn keeps that reply from being read as this
+                    // turn's answer.
+                    new_turn: cur_count > baseline_count,
+                    text: &atext,
+                },
+                Instant::now(),
+            );
+            if !due {
                 continue;
             }
 
-            // We only reach here with the stop button GONE and no tool active —
-            // i.e. generation has actually ended (a genuine mid-stream gap keeps
-            // `stop` true, so we `continue` above and never land here). Fast path:
-            // settle once the visible text has been unchanged for `stable_needed`
-            // polls. Crucially `idle_count` ALWAYS increments in this branch and is
-            // never reset, so `idle_limit` is a HARD ceiling — without that, the
-            // DOM re-rendering a finished reply (collapsible tool-call disclosures
-            // mutating innerText) would reset the counter every poll and wedge us
-            // in "waiting for reply" forever.
-            // Require a NEW assistant turn, not merely "some assistant message
-            // exists". Without this, a turn that never actually submitted (Enter
-            // swallowed, send-button fallback missed) lands here on the first
-            // poll — stop button absent, previous reply static — and we scrape
-            // the PREVIOUS turn's text and return it as this turn's answer.
-            // Fail closed: no new turn means we keep waiting, then time out.
-            if cur_count > baseline_count {
-                if !atext.is_empty() && atext == prev_stable {
-                    stable_polls += 1;
-                    if stable_polls >= stable_needed {
-                        break;
+            match self.record_verdict(remaining_secs().min(30.0)) {
+                Verdict::Done(answer) => {
+                    log_completion("record", &answer, started.elapsed());
+                    return self.finish_turn(answer.text, remaining_secs());
+                }
+                Verdict::CutOff { kind, reason, chars } => return Err(kind.error(reason, chars)),
+                Verdict::Open => watch.record_open(Instant::now()),
+                Verdict::Unreadable => {
+                    watch.record_unreadable(Instant::now());
+
+                    // The one window with no record to ask: a brand-new chat,
+                    // before ChatGPT puts /c/<id> in the URL. Take the page's
+                    // copy only when it has settled AND it is a reply rather
+                    // than the message chrome. Every pinned turn above waits for
+                    // the record instead of falling back to this.
+                    if self.convo_id.is_none() && watch.settled() {
+                        if let Some(id) = self.current_convo_id(remaining_secs()) {
+                            eprintln!("pinned to conversation {id}");
+                            self.convo_id = Some(id);
+                            self.touch_receipt();
+                            continue;
+                        }
+                        let scraped = ab_eval(
+                            &self.ab,
+                            JS_LAST_ASSISTANT,
+                            &self.session,
+                            remaining_secs(),
+                        )
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| last_atext.clone());
+                        if let Some(text) = usable_reply(&scraped, title) {
+                            log_scraped_completion(text.chars().count(), started.elapsed());
+                            return self.finish_turn(text, remaining_secs());
+                        }
+                        eprintln!("the page shows no usable reply yet; waiting for the record");
+                        // Chrome is not evidence. Start collecting the page's
+                        // quiescence again rather than re-scraping every tick.
+                        watch.record_open(Instant::now());
                     }
-                } else {
-                    prev_stable = atext.clone();
-                    stable_polls = 0;
-                }
-                idle_count += 1;
-                if idle_count >= idle_limit {
-                    break; // safety net: generation ended but text never went stable
                 }
             }
         }
-
-        // The DOM has settled. Prefer the SERVER's copy of the reply anyway.
-        //
-        // What we scrape is rendered markdown, not what the model wrote:
-        // `**structural validation**` reaches innerText as `structural
-        // validation`. Measured on one 600-word reply, the scrape lost 87
-        // characters of syntax against the conversation record. For prose that
-        // is a fidelity loss; for the tool protocol it is a correctness bug,
-        // and the same one that made a ```json fence unmatchable — the fence is
-        // simply not in the rendered text.
-        //
-        // So the record is the source of truth whenever we have a conversation
-        // to ask about, and the scrape is the fallback for the turn-one window
-        // where no id exists yet.
-        if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
-            if !text.trim().is_empty() {
-                return self.finish_turn(text, remaining_secs());
-            }
-        }
-
-        // Scrape the last assistant message — prefer innerText (rendered markdown).
-        let reply_text = ab_eval(
-            &self.ab,
-            JS_LAST_ASSISTANT,
-            &self.session,
-            remaining_secs(),
-        )
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| last_atext.clone());
-
-        self.finish_turn(reply_text, remaining_secs())
     }
 
-    /// Everything a completed turn owes regardless of HOW it completed — the DOM
-    /// settling, or the server saying so. Kept in one place so the two paths
-    /// cannot drift: a reply taken from the conversation record must still pin
-    /// the conversation and still get filed into its project.
+    /// Everything a completed turn owes regardless of HOW it completed — the
+    /// record proving it closed, or (turn one, no id yet) a settled page with
+    /// a real reply on it. Kept in one place so the two paths cannot drift: a
+    /// reply taken from the conversation record must still pin the conversation
+    /// and still get filed into its project.
     fn finish_turn(&mut self, reply_text: String, budget: f64) -> Result<String> {
         if reply_text.trim().is_empty() {
-            bail!("scraped an empty reply from ChatGPT");
+            bail!("ChatGPT's reply was empty");
         }
 
         // Latch identity on the first completed turn: a brand-new chat has no
@@ -3028,14 +3033,194 @@ impl SubmitFailure {
     }
 }
 
-/// One read of the conversation record for the current turn.
-struct ServerTurn {
-    /// `end_turn` on the turn's last assistant message.
-    done: bool,
-    text: String,
-    /// `finish_details.type`: "stop" for a real finish.
+/// One node of the live turn, as the conversation record states it.
+///
+/// Parsed at the boundary ([`RecordTurn::from_json`]), so the judgement works
+/// on typed values and `null` from the page is already normalised here.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RecordNode {
+    id: String,
+    role: String,
+    content_type: String,
+    /// `message.channel`: "final" is the public answer; "commentary" and
+    /// "analysis" are steps that are not the answer.
+    channel: String,
+    recipient: String,
+    weight: f64,
+    end_turn: bool,
+    /// `message.status` and the node's own `status`, kept apart: either one
+    /// saying `in_progress` means the turn is still being written.
+    status: String,
+    node_status: String,
+    is_complete: bool,
+    hidden: bool,
+    /// `metadata.finish_details.type`: "stop" for a real finish.
     finish: Option<String>,
     reason: Option<String>,
+    text: String,
+}
+
+impl RecordNode {
+    fn from_json(v: &serde_json::Value) -> Self {
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let optional = |k: &str| {
+            let s = s(k);
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        };
+        RecordNode {
+            id: s("id"),
+            role: s("role"),
+            content_type: s("content_type"),
+            channel: s("channel"),
+            recipient: s("recipient"),
+            weight: v.get("weight").and_then(|x| x.as_f64()).unwrap_or(1.0),
+            end_turn: v.get("end_turn").and_then(|x| x.as_bool()).unwrap_or(false),
+            status: s("status"),
+            node_status: s("node_status"),
+            is_complete: v
+                .get("is_complete")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            hidden: v.get("hidden").and_then(|x| x.as_bool()).unwrap_or(false),
+            finish: optional("finish"),
+            reason: optional("reason"),
+            text: s("text"),
+        }
+    }
+
+    fn is_assistant(&self) -> bool {
+        self.role == "assistant"
+    }
+
+    fn has_text(&self) -> bool {
+        !self.text.trim().is_empty()
+    }
+
+    fn is_in_progress(&self) -> bool {
+        self.status == "in_progress" || self.node_status == "in_progress"
+    }
+}
+
+/// The record's view of the current turn: every node from the newest back to
+/// (but not including) the latest user message, plus the identity fields.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RecordTurn {
+    conversation_id: String,
+    user_text: Option<String>,
+    /// Newest first.
+    nodes: Vec<RecordNode>,
+}
+
+impl RecordTurn {
+    fn from_json(v: &serde_json::Value) -> Option<Self> {
+        Some(RecordTurn {
+            conversation_id: v
+                .get("conversation_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            user_text: v
+                .get("user_text")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            nodes: v
+                .get("nodes")?
+                .as_array()?
+                .iter()
+                .map(RecordNode::from_json)
+                .collect(),
+        })
+    }
+
+    /// Does the record say which messages are public answers? Without a
+    /// `channel` anywhere, a step and the answer look identical, so the record
+    /// proves nothing (see [`judge_record`]).
+    fn marks_channels(&self) -> bool {
+        self.nodes.iter().any(|n| !n.channel.is_empty())
+    }
+}
+
+/// A reply the record proves finished.
+#[derive(Debug, Clone, PartialEq)]
+struct Answer {
+    text: String,
+    message_id: String,
+    end_turn: bool,
+    finish: Option<String>,
+    content_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutOffKind {
+    Interrupted,
+    MaxTokens,
+}
+
+impl CutOffKind {
+    fn error(self, reason: Option<String>, chars: usize) -> anyhow::Error {
+        let why = match (self, reason.as_deref()) {
+            (CutOffKind::MaxTokens, _) => "hit its length limit and was cut off".to_string(),
+            (CutOffKind::Interrupted, Some(reason)) => format!("was interrupted ({reason})"),
+            (CutOffKind::Interrupted, None) => "was interrupted".to_string(),
+        };
+        ChannelError::new(
+            ErrorKind::Incomplete,
+            format!(
+                "ChatGPT's reply {why} before it finished; the {chars} characters so far are \
+                 partial, so they are not returned as a reply"
+            ),
+        )
+        .with_submitted(Submitted::Yes)
+        .into()
+    }
+}
+
+/// What one record read proves about the turn.
+#[derive(Debug, Clone, PartialEq)]
+enum Verdict {
+    Done(Answer),
+    /// Readable, and the turn has not closed.
+    Open,
+    /// Closed early by a stop or the length limit.
+    CutOff {
+        kind: CutOffKind,
+        reason: Option<String>,
+        chars: usize,
+    },
+    /// No proof: the read failed, or the record is not this turn.
+    Unreadable,
+}
+
+/// Is this node a candidate for the public answer? Only the `final` channel
+/// carries the answer; `commentary`/`analysis` are steps, and a record that
+/// marks no channel at all is judged open before this is asked.
+fn is_answer(n: &RecordNode) -> bool {
+    n.is_assistant()
+        && !n.hidden
+        && n.weight != 0.0
+        && (n.recipient.is_empty() || n.recipient == "all")
+        && matches!(n.content_type.as_str(), "" | "text" | "multimodal_text")
+        && n.channel == "final"
+        && n.has_text()
+}
+
+/// A node that may legitimately sit AFTER the answer: the "Thought for Xs"
+/// disclosure ChatGPT writes once the answer is done, or a structural node
+/// with nothing on it. Hidden nodes never reach this check. Anything else
+/// newer than the answer means the turn kept writing, so that message was a
+/// step, not the reply.
+fn is_afterword(n: &RecordNode) -> bool {
+    n.role.is_empty()
+        || n.content_type == "reasoning_recap"
+        || (n.weight == 0.0 && !n.has_text())
+}
+
+fn is_cut_off(n: &RecordNode) -> bool {
+    matches!(n.finish.as_deref(), Some("interrupted" | "max_tokens"))
 }
 
 /// Judge a record read. A stopped turn is closed like a finished one
@@ -3045,28 +3230,339 @@ struct ServerTurn {
 /// so it is an incomplete turn, never a reply. Only KNOWN cut-offs count
 /// against a reply; an unrecognised finish type passes as a normal finish, so
 /// a model that labels its stop differently keeps working.
-fn judge_record(turn: ServerTurn) -> Result<Option<String>> {
-    match turn.finish.as_deref() {
-        Some(kind @ ("interrupted" | "max_tokens")) => {
-            let why = match (kind, turn.reason.as_deref()) {
-                ("max_tokens", _) => "hit its length limit and was cut off".to_string(),
-                (_, Some(reason)) => format!("was interrupted ({reason})"),
-                _ => "was interrupted".to_string(),
+///
+/// `Done` needs proof, not a plausible message: the newest assistant answer is
+/// the newest thing the turn wrote (apart from the reasoning disclosure), that
+/// message says `end_turn`, it finished successfully, and nothing above it is
+/// still being written. A per-message `end_turn` alone is not proof — a
+/// multi-step turn closes each STEP, and taking one of those as the answer is
+/// how a `completed` envelope beat the real reply.
+fn judge_record(turn: &RecordTurn) -> Verdict {
+    // `hidden` messages are not rendered: a regenerated tail, tool plumbing.
+    // They are not part of the conversation the user sees, so they are neither
+    // the answer nor newer writing that keeps a visible answer open. Measured
+    // live: a long answer was regenerated and the record kept the hidden tail
+    // ABOVE the visible complete answer, which held the turn open forever.
+    let nodes: Vec<&RecordNode> = turn.nodes.iter().filter(|n| !n.hidden).collect();
+
+    if let Some((i, n)) = nodes.iter().enumerate().find(|(_, n)| is_cut_off(n)) {
+        // A marker a later visible message already superseded (an interrupted
+        // thinking step, then a finished answer) is not this turn's ending.
+        let superseded = nodes[..i]
+            .iter()
+            .any(|newer| newer.is_assistant() && newer.has_text());
+        if !superseded {
+            return Verdict::CutOff {
+                kind: if n.finish.as_deref() == Some("max_tokens") {
+                    CutOffKind::MaxTokens
+                } else {
+                    CutOffKind::Interrupted
+                },
+                reason: n.reason.clone(),
+                chars: nodes[..=i]
+                    .iter()
+                    .find(|x| x.has_text())
+                    .map(|x| x.text.chars().count())
+                    .unwrap_or(0),
             };
-            Err(ChannelError::new(
-                ErrorKind::Incomplete,
-                format!(
-                    "ChatGPT's reply {why} before it finished; the {} characters so far are \
-                     partial, so they are not returned as a reply",
-                    turn.text.chars().count()
-                ),
-            )
-            .with_submitted(Submitted::Yes)
-            .into())
         }
-        _ if turn.done && !turn.text.trim().is_empty() => Ok(Some(turn.text)),
-        _ => Ok(None),
     }
+
+    // Without a `channel` anywhere there is no way to tell a public answer
+    // from a step: a multi-step turn closes each step with `end_turn` too, so
+    // the message's own flags cannot prove the turn is over. (A record with no
+    // assistant message yet is the same case.) Keep waiting; the caller turns
+    // an expired wait into an incomplete turn rather than a reply.
+    if !turn.marks_channels() {
+        return Verdict::Open;
+    }
+
+    let Some(idx) = nodes.iter().position(|n| is_answer(n)) else {
+        return Verdict::Open;
+    };
+    let answer = nodes[idx];
+
+    // The answer must be the newest thing the turn wrote.
+    if !nodes[..idx].iter().all(|n| is_afterword(n)) {
+        return Verdict::Open;
+    }
+    // Anything still being written ABOVE the answer keeps the turn open,
+    // whatever the answer's own flags say. Nodes below it are older history:
+    // a stale `in_progress` there cannot be written again once a newer answer
+    // closed, and scanning them would hold a finished turn open until timeout.
+    if nodes[..=idx].iter().any(|n| n.is_in_progress()) {
+        return Verdict::Open;
+    }
+    if !answer.end_turn
+        || !answer.is_complete
+        || !matches!(answer.status.as_str(), "" | "finished_successfully")
+    {
+        return Verdict::Open;
+    }
+    let text = strip_private_markers(answer.text.trim());
+    if text.trim().is_empty() {
+        return Verdict::Open;
+    }
+    Verdict::Done(Answer {
+        text,
+        message_id: answer.id.clone(),
+        end_turn: answer.end_turn,
+        finish: answer.finish.clone(),
+        content_type: answer.content_type.clone(),
+    })
+}
+
+/// Does this record describe the turn we are waiting on? A conversation id or
+/// user prompt that disagrees means no verdict may be drawn from it.
+fn record_is_ours(
+    turn: &RecordTurn,
+    convo_id: Option<&str>,
+    prompt: Option<&str>,
+    connector: bool,
+) -> bool {
+    if let Some(want) = convo_id.filter(|s| !s.is_empty()) {
+        if !turn.conversation_id.is_empty() && turn.conversation_id != want {
+            return false;
+        }
+    }
+    match (prompt, turn.user_text.as_deref()) {
+        (Some(want), Some(got)) => same_prompt(want, got, connector),
+        // The record does not say which user turn this is. That is not
+        // permission to assume it is ours: the previous turn's answer is
+        // closed and sits in the same conversation, so accepting it would
+        // return an old reply for a new prompt. Wait for a record that names
+        // the turn.
+        (Some(_), None) => false,
+        // No prompt to compare (resume attaches).
+        (None, _) => true,
+    }
+}
+
+/// Compare a submitted prompt with the record's copy. The record may normalize
+/// whitespace, a connector mention is prepended as a pill, and a very long
+/// prompt need not survive verbatim — so a long prompt is identified by its
+/// opening and a connector turn by its tail.
+fn same_prompt(expected: &str, got: &str, connector: bool) -> bool {
+    let e = normalize_space(expected);
+    let g = normalize_space(got);
+    if e == g {
+        return true;
+    }
+    if connector && g.ends_with(&e) {
+        return true;
+    }
+    let head: String = e.chars().take(200).collect();
+    e.chars().count() > 200 && g.contains(&head)
+}
+
+fn normalize_space(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The words ChatGPT's own message chrome renders as text.
+const CHROME_WORDS: &[&str] = &[
+    "chatgpt", "gpt", "assistant", "you", "said", "says", "답변", "응답", "回答", "答復", "回复",
+    "回應", "响应",
+];
+
+/// Split off the first word, where a "word" is a run of letters or digits in
+/// any script. Korean/Chinese labels are single words by this rule.
+fn split_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !c.is_alphanumeric())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&s[..end], &s[end..]))
+}
+
+fn is_chrome_word(w: &str) -> bool {
+    CHROME_WORDS.iter().any(|c| w.eq_ignore_ascii_case(c))
+}
+
+/// `Some(rest)` when the text opens with a colon-terminated chrome header
+/// ("ChatGPT 답변:", "ChatGPT said:"), `None` for ordinary prose. The colon is
+/// what separates a header from a sentence that merely starts with a label
+/// word ("You can ...").
+fn chrome_header_rest(s: &str) -> Option<&str> {
+    let mut rest = s.trim_start();
+    loop {
+        let (word, tail) = split_word(rest)?;
+        if !is_chrome_word(word) {
+            return None;
+        }
+        rest = tail.trim_start();
+        if let Some(after) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('：')) {
+            return Some(after);
+        }
+    }
+}
+
+/// True when the text is nothing but chrome labels and punctuation.
+fn chrome_only(s: &str) -> bool {
+    let mut rest = s.trim_start();
+    loop {
+        match split_word(rest) {
+            None => return true,
+            Some((word, tail)) => {
+                if !is_chrome_word(word) {
+                    return false;
+                }
+                rest = tail.trim_start().trim_start_matches([':', '：']).trim_start();
+            }
+        }
+    }
+}
+
+/// Is `text` a reply a reader could have seen, rather than a piece of ChatGPT's
+/// own chrome? The assistant header renders as `sr-only` text, so a message
+/// with no content yet scrapes as its own label ("ChatGPT 답변:ChatGPT"). That
+/// is the exact string that reached a `completed` envelope.
+fn usable_reply(text: &str, page_title: &str) -> Option<String> {
+    let mut s = text.trim();
+    if let Some(rest) = chrome_header_rest(s) {
+        s = rest.trim();
+    }
+    if s.is_empty() || chrome_only(s) {
+        return None;
+    }
+    // The tab title is the chat's name, never its reply. A scrape that equals
+    // it came from the wrong element.
+    let title = page_title.trim();
+    if !title.is_empty() && s.eq_ignore_ascii_case(title) {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// One poll's view of the page. Progress only: none of this can close a turn.
+#[derive(Debug, Clone, Copy)]
+struct DomProgress<'a> {
+    stop: bool,
+    tool_active: bool,
+    /// A new assistant turn exists (the count rose above the baseline).
+    new_turn: bool,
+    text: &'a str,
+}
+
+/// No record read before this long after a readable "still open" answer.
+const RECORD_RECHECK_STREAMING: Duration = Duration::from_secs(20);
+/// …and this long after one when the page looks settled, which is when the
+/// turn is most likely to have just closed.
+const RECORD_RECHECK_SETTLED: Duration = Duration::from_secs(5);
+const RECORD_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const RECORD_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The completion state machine for one turn.
+///
+/// It owns exactly two questions: has the page gone quiet enough that the
+/// record is worth asking, and has the record been asked recently enough. The
+/// answer to "is the turn finished" never lives here — see [`judge_record`].
+/// Keeping the counters in one tested place is what stops a settled page from
+/// quietly becoming a completed turn again.
+struct Watch {
+    stable_needed: u32,
+    idle_limit: u32,
+    prev_text: String,
+    stable_polls: u32,
+    idle_polls: u32,
+    /// No record read before this instant.
+    next_record: Instant,
+    /// Current wait after an unreadable read.
+    backoff: Duration,
+}
+
+impl Watch {
+    fn new(opts: &SendOptions, now: Instant) -> Self {
+        Watch {
+            stable_needed: opts.stable_needed.max(1),
+            idle_limit: opts.idle_limit.max(1),
+            prev_text: String::new(),
+            stable_polls: 0,
+            idle_polls: 0,
+            next_record: now,
+            backoff: RECORD_BACKOFF_MIN,
+        }
+    }
+
+    /// Fold one poll in. `true` means the record should be asked now.
+    fn observe(&mut self, dom: DomProgress, now: Instant) -> bool {
+        if dom.stop || dom.tool_active || !dom.new_turn {
+            self.stable_polls = 0;
+            self.idle_polls = 0;
+            self.prev_text.clear();
+        } else {
+            if !dom.text.is_empty() && dom.text == self.prev_text {
+                self.stable_polls += 1;
+            } else {
+                self.prev_text = dom.text.to_string();
+                self.stable_polls = 0;
+            }
+            // Never reset: a reply whose innerText keeps mutating (collapsible
+            // tool disclosures) must still reach the record eventually.
+            self.idle_polls += 1;
+        }
+        now >= self.next_record
+    }
+
+    /// The page has gone quiet with a new assistant turn on it.
+    fn settled(&self) -> bool {
+        self.stable_polls >= self.stable_needed || self.idle_polls >= self.idle_limit
+    }
+
+    /// The record says the turn is still open: the page's quiescence is spent
+    /// evidence, so start collecting it again.
+    fn record_open(&mut self, now: Instant) {
+        let settled = self.settled();
+        self.stable_polls = 0;
+        self.idle_polls = 0;
+        self.backoff = RECORD_BACKOFF_MIN;
+        self.next_record = now
+            + if settled {
+                RECORD_RECHECK_SETTLED
+            } else {
+                RECORD_RECHECK_STREAMING
+            };
+    }
+
+    /// The record could not be read: back off, bounded, so a throttled or
+    /// broken record endpoint is retried without hammering it.
+    fn record_unreadable(&mut self, now: Instant) {
+        self.next_record = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(RECORD_BACKOFF_MAX);
+    }
+}
+
+/// Report HOW a turn completed, never WHAT it said: enough to diagnose a wrong
+/// completion from a log alone, and nothing private.
+fn log_completion(source: &str, answer: &Answer, elapsed: Duration) {
+    let content_type = if answer.content_type.is_empty() {
+        "-"
+    } else {
+        &answer.content_type
+    };
+    eprintln!(
+        "completion: source={source} message_id={} end_turn={} finish_details={} content_type={} \
+         text_len={} elapsed_ms={}",
+        answer.message_id,
+        answer.end_turn,
+        answer.finish.as_deref().unwrap_or("-"),
+        content_type,
+        answer.text.chars().count(),
+        elapsed.as_millis(),
+    );
+}
+
+fn log_scraped_completion(text_len: usize, elapsed: Duration) {
+    eprintln!(
+        "completion: source=dom_unpinned message_id=- end_turn=- finish_details=- content_type=text \
+         text_len={text_len} elapsed_ms={}",
+        elapsed.as_millis(),
+    );
 }
 
 /// Cross-process lock on the shared ChatGPT web surface.
@@ -3832,6 +4328,7 @@ mod tests {
             ("mention_menu", &js_mention_menu("chatgpt-use")),
             ("connector_pill", &js_connector_pill("chatgpt-use")),
             ("picker_menu", JS_PICKER_MENU),
+            ("server_final", &js_server_final("11111111-2222-3333-4444-555555555555")),
         ] {
             std::fs::write(dir.join(format!("{name}.js")), js).unwrap();
         }
@@ -4065,43 +4562,622 @@ mod tests {
         assert_eq!(RateLimited.status(), "unavailable");
     }
 
-    fn turn(done: bool, text: &str, finish: Option<&str>, reason: Option<&str>) -> ServerTurn {
-        ServerTurn {
-            done,
-            text: text.into(),
-            finish: finish.map(Into::into),
-            reason: reason.map(Into::into),
+    /// A record projection as `js_server_final` emits it.
+    fn record(nodes: serde_json::Value, user: &str) -> RecordTurn {
+        RecordTurn::from_json(&serde_json::json!({
+            "conversation_id": "c1",
+            "current_node": "n",
+            "user_text": user,
+            "nodes": nodes,
+        }))
+        .expect("a projection with nodes parses")
+    }
+
+    /// An assistant node with the defaults a finished answer carries.
+    fn assistant(id: &str, text: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut n = serde_json::json!({
+            "id": id, "role": "assistant", "content_type": "text",
+            "channel": "final", "recipient": "all", "weight": 1,
+            "end_turn": true, "status": "finished_successfully",
+            "is_complete": true, "hidden": false, "finish": "", "reason": "",
+            "text": text,
+        });
+        for (k, v) in extra.as_object().expect("object") {
+            n[k] = v.clone();
         }
+        n
+    }
+
+    /// The measured defect: the newest node is a visible progress message, and
+    /// the old probe returned it as a finished answer.
+    #[test]
+    fn an_intermediate_step_is_not_the_answer() {
+        let t = record(
+            serde_json::json!([
+                assistant("a2", "Now running the tests.", serde_json::json!({"channel": "commentary"})),
+                assistant("a1", "I'll inspect the repo first.", serde_json::json!({
+                    "channel": "commentary", "end_turn": false,
+                })),
+            ]),
+            "do the thing",
+        );
+        assert_eq!(judge_record(&t), Verdict::Open);
+    }
+
+    /// A record that marks no channel cannot tell a step from the answer: a
+    /// multi-step turn closes each step with `end_turn` too. The same shape
+    /// that closed a turn early must stay open here.
+    #[test]
+    fn a_record_without_channels_cannot_prove_the_turn_closed() {
+        let step = record(
+            serde_json::json!([assistant("a2", "Step 2: running tests", serde_json::json!({
+                "channel": "",
+            }))]),
+            "q",
+        );
+        assert_eq!(judge_record(&step), Verdict::Open);
+
+        // A channel-marked neighbour does not license reading a channel-less
+        // message as the answer either; only `final` is the answer.
+        let mixed = record(
+            serde_json::json!([
+                assistant("a2", "the answer?", serde_json::json!({"channel": ""})),
+                {"id":"t1","role":"tool","content_type":"tool_result",
+                 "channel":"commentary","status":"finished_successfully","text":""},
+            ]),
+            "q",
+        );
+        assert_eq!(judge_record(&mixed), Verdict::Open);
+    }
+
+    /// An older node still marked `in_progress` cannot be written once a newer
+    /// answer closed, so it must not hold the finished turn open.
+    #[test]
+    fn a_stale_step_below_the_answer_does_not_hold_the_turn_open() {
+        let t = record(
+            serde_json::json!([
+                assistant("a1", "the answer", serde_json::json!({"finish": "stop"})),
+                {"id":"t1","role":"assistant","content_type":"tool_result",
+                 "channel":"commentary","status":"in_progress",
+                 "node_status":"in_progress","text":""},
+            ]),
+            "q",
+        );
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "the answer"));
+    }
+
+    /// A record that does not name its user turn could be the previous turn,
+    /// whose answer is already closed. It is not proof of this turn.
+    #[test]
+    fn a_record_that_does_not_name_the_turn_is_not_ours() {
+        let t = RecordTurn::from_json(&serde_json::json!({
+            "conversation_id": "c1",
+            "nodes": [],
+        }))
+        .expect("parses");
+        assert!(!record_is_ours(&t, Some("c1"), Some("q"), false));
+
+        // With no prompt to compare (resume), there is nothing to contradict.
+        assert!(record_is_ours(&t, Some("c1"), None, false));
+    }
+
+    /// A thinking step is newer than the visible message below it, so that
+    /// message is not final either.
+    #[test]
+    fn a_thinking_step_above_the_answer_keeps_the_turn_open() {
+        let t = record(
+            serde_json::json!([
+                {"id":"t1","role":"assistant","content_type":"thoughts",
+                 "status":"finished_successfully","weight":1,"text":""},
+                assistant("a1", "an older visible message", serde_json::json!({})),
+            ]),
+            "q",
+        );
+        assert_eq!(judge_record(&t), Verdict::Open);
+    }
+
+    /// The one thing that may follow the answer: ChatGPT's own "Thought for Xs"
+    /// disclosure.
+    #[test]
+    fn the_reasoning_recap_after_the_answer_is_not_a_new_step() {
+        let t = record(
+            serde_json::json!([
+                {"id":"r1","role":"assistant","content_type":"reasoning_recap",
+                 "status":"finished_successfully","weight":1,"text":"Thought for 5s"},
+                assistant("a1", "the answer", serde_json::json!({})),
+            ]),
+            "q",
+        );
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "the answer"));
+    }
+
+    #[test]
+    fn a_turn_that_is_still_streaming_is_open() {
+        let t = record(
+            serde_json::json!([assistant("a1", "half a sen", serde_json::json!({
+                "end_turn": false, "status": "in_progress",
+            }))]),
+            "q",
+        );
+        assert_eq!(judge_record(&t), Verdict::Open);
+    }
+
+    #[test]
+    fn a_real_finish_is_a_reply_and_an_unknown_finish_still_passes() {
+        let done = record(serde_json::json!([assistant("a1", "done", serde_json::json!({
+            "finish": "stop",
+        }))]), "q");
+        assert!(matches!(judge_record(&done), Verdict::Done(a) if a.text == "done"));
+
+        // An unknown finish type is not treated as a failure: a model that
+        // labels its stop differently must keep working.
+        let odd = record(serde_json::json!([assistant("a1", "done", serde_json::json!({
+            "finish": "new_kind",
+        }))]), "q");
+        assert!(matches!(judge_record(&odd), Verdict::Done(_)));
+    }
+
+    /// Short is not a placeholder. The old code's only check was non-empty.
+    #[test]
+    fn a_short_answer_is_a_reply() {
+        let t = record(serde_json::json!([assistant("a1", "OK", serde_json::json!({}))]), "q");
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "OK"));
     }
 
     #[test]
     fn a_stopped_turn_is_incomplete_not_a_reply() {
         // Exactly what the record showed after the stop button, live.
-        let e = judge_record(turn(true, "partial essay", Some("interrupted"), Some("client_stopped")))
-            .unwrap_err();
-        let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
-        assert!(e.to_string().contains("client_stopped"), "{e}");
-
-        let e = judge_record(turn(true, "", Some("max_tokens"), None)).unwrap_err();
-        assert!(e.to_string().contains("length limit"), "{e}");
+        let t = record(serde_json::json!([assistant("a1", "partial essay", serde_json::json!({
+            "finish": "interrupted", "reason": "client_stopped",
+        }))]), "q");
+        match judge_record(&t) {
+            Verdict::CutOff { kind, reason, chars } => {
+                assert_eq!(kind, CutOffKind::Interrupted);
+                assert_eq!(reason.as_deref(), Some("client_stopped"));
+                assert_eq!(chars, "partial essay".chars().count());
+                let e = kind.error(reason, chars);
+                let ce = channel_error(&e).unwrap();
+                assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+                assert!(e.to_string().contains("client_stopped"), "{e}");
+            }
+            v => panic!("{v:?}"),
+        }
     }
 
     #[test]
-    fn a_real_finish_is_a_reply_and_an_open_turn_is_not_yet() {
-        assert_eq!(judge_record(turn(true, "done", Some("stop"), None)).unwrap(), Some("done".into()));
-        // An unknown finish type is not treated as a failure.
-        assert_eq!(judge_record(turn(true, "done", Some("new_kind"), None)).unwrap(), Some("done".into()));
-        assert_eq!(judge_record(turn(true, "done", None, None)).unwrap(), Some("done".into()));
-        assert_eq!(judge_record(turn(false, "streaming", None, None)).unwrap(), None);
-        assert_eq!(judge_record(turn(true, "  ", Some("stop"), None)).unwrap(), None);
+    fn a_length_capped_turn_is_incomplete_even_with_no_text() {
+        let t = record(serde_json::json!([assistant("a1", "", serde_json::json!({
+            "finish": "max_tokens",
+        }))]), "q");
+        match judge_record(&t) {
+            Verdict::CutOff { kind, chars, .. } => {
+                assert_eq!(kind, CutOffKind::MaxTokens);
+                assert_eq!(chars, 0);
+            }
+            v => panic!("{v:?}"),
+        }
+    }
+
+    /// A thinking step cut off before a finished answer is not this turn's end.
+    #[test]
+    fn a_cut_off_step_before_the_answer_is_not_the_ending() {
+        let t = record(
+            serde_json::json!([
+                assistant("a1", "the answer", serde_json::json!({"finish": "stop"})),
+                {"id":"t1","role":"assistant","content_type":"thoughts",
+                 "status":"finished_successfully","weight":1,
+                 "finish":"interrupted","text":""},
+            ]),
+            "q",
+        );
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "the answer"));
+    }
+
+    /// The exact projections the page probe returned for the three fixtures
+    /// (measured offline under node), fed through the Rust judge. Before the
+    /// split, the probe answered `done: true` with the intermediate text for
+    /// the first two.
+    #[test]
+    fn the_measured_progress_projections_are_not_answers() {
+        let in_progress = serde_json::json!({
+            "ok": true, "conversation_id": "c1", "current_node": "a2", "async_status": 4,
+            "user_text": "u1 text",
+            "nodes": [
+                {"id":"a2","role":"assistant","content_type":"text","channel":"commentary",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "is_complete":true,"hidden":false,"finish":"","reason":"","text":"a2 text"},
+                {"id":"a1","role":"assistant","content_type":"text","channel":"commentary",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "is_complete":true,"hidden":false,"finish":"","reason":"","text":"a1 text"}
+            ]
+        });
+        let thinking = serde_json::json!({
+            "ok": true, "conversation_id": "c1", "current_node": "t1", "async_status": 4,
+            "user_text": "u1 text",
+            "nodes": [
+                {"id":"t1","role":"assistant","content_type":"thoughts","channel":"",
+                 "recipient":"","weight":1,"end_turn":false,"status":"in_progress",
+                 "is_complete":true,"hidden":false,"finish":"","reason":"","text":""},
+                {"id":"a1","role":"assistant","content_type":"text","channel":"commentary",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "is_complete":true,"hidden":false,"finish":"","reason":"","text":"a1 text"}
+            ]
+        });
+        let finished = serde_json::json!({
+            "ok": true, "conversation_id": "c1", "current_node": "a2", "async_status": null,
+            "user_text": "u1 text",
+            "nodes": [
+                {"id":"a2","role":"assistant","content_type":"text","channel":"final",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "is_complete":true,"hidden":false,"finish":"stop","reason":"","text":"a2 text"},
+                {"id":"a1","role":"assistant","content_type":"text","channel":"commentary",
+                 "recipient":"web.run","weight":1,"end_turn":false,"status":"finished_successfully",
+                 "is_complete":true,"hidden":false,"finish":"","reason":"","text":"a1 text"}
+            ]
+        });
+        let interrupted = serde_json::json!({
+            "ok": true, "conversation_id": "c1", "user_text": "u1 text",
+            "nodes": [
+                {"id":"a1","role":"assistant","content_type":"text","channel":"final",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "node_status":"","is_complete":true,"hidden":false,
+                 "finish":"interrupted","reason":"client_stopped","text":"a1 text"}
+            ]
+        });
+        let max_tokens = serde_json::json!({
+            "ok": true, "conversation_id": "c1", "user_text": "u1 text",
+            "nodes": [
+                {"id":"a1","role":"assistant","content_type":"text","channel":"final",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "node_status":"","is_complete":true,"hidden":false,
+                 "finish":"max_tokens","reason":"","text":"a1 text"}
+            ]
+        });
+        let multi_final = serde_json::json!({
+            "ok": true, "conversation_id": "c1", "user_text": "u1 text",
+            "nodes": [
+                {"id":"a2","role":"assistant","content_type":"text","channel":"final",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "node_status":"","is_complete":true,"hidden":false,"finish":"","reason":"",
+                 "text":"a2 text"},
+                {"id":"a1","role":"assistant","content_type":"text","channel":"final",
+                 "recipient":"","weight":1,"end_turn":true,"status":"finished_successfully",
+                 "node_status":"","is_complete":true,"hidden":false,"finish":"","reason":"",
+                 "text":"a1 text"}
+            ]
+        });
+        for (name, v) in [("in-progress", in_progress), ("thinking", thinking)] {
+            let t = RecordTurn::from_json(&v).expect("parses");
+            assert_eq!(judge_record(&t), Verdict::Open, "{name}");
+        }
+        let t = RecordTurn::from_json(&finished).expect("parses");
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "a2 text"));
+
+        let t = RecordTurn::from_json(&interrupted).expect("parses");
+        match judge_record(&t) {
+            Verdict::CutOff { kind, reason, .. } => {
+                assert_eq!(kind, CutOffKind::Interrupted);
+                assert_eq!(reason.as_deref(), Some("client_stopped"));
+            }
+            v => panic!("{v:?}"),
+        }
+        let t = RecordTurn::from_json(&max_tokens).expect("parses");
+        assert!(matches!(
+            judge_record(&t),
+            Verdict::CutOff { kind: CutOffKind::MaxTokens, .. }
+        ));
+        let t = RecordTurn::from_json(&multi_final).expect("parses");
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "a2 text"));
+    }
+
+    /// Measured live on 2026-11-16: the record of a web-search turn, newest
+    /// first. A tool call and two thinking nodes sit below the final answer,
+    /// so a judge that reads any step as the ending would answer with an
+    /// intermediate message or nothing at all.
+    #[test]
+    fn the_measured_search_turn_closes_on_the_final_answer() {
+        let t = record(
+            serde_json::json!([
+                assistant(
+                    "f1",
+                    "RUST=1.100.0 (blog.rust-lang.org)\nNODE=26.13.1 (nodejs.org)",
+                    serde_json::json!({"finish": "stop"}),
+                ),
+                {"id":"r1","role":"assistant","content_type":"reasoning_recap",
+                 "channel":"","status":"finished_successfully","weight":1,
+                 "end_turn":false,"text":""},
+                {"id":"t1","role":"assistant","content_type":"thoughts",
+                 "channel":"","status":"finished_successfully","weight":1,
+                 "end_turn":false,"text":""},
+                {"id":"tool1","role":"tool","content_type":"text","channel":"",
+                 "status":"finished_successfully","text":""},
+                {"id":"step1","role":"assistant","content_type":"text","channel":"",
+                 "end_turn":false,"finish":"stop","status":"finished_successfully",
+                 "weight":1,"text":""},
+            ]),
+            "q",
+        );
+        assert!(matches!(
+            judge_record(&t),
+            Verdict::Done(a) if a.text.starts_with("RUST=1.100.0")
+        ));
+    }
+
+    /// Measured live on 2026-11-16: a long answer was regenerated, and the
+    /// record kept the regenerated tail as a hidden node ABOVE the visible
+    /// complete answer. The hidden node is not rendered, so it can neither be
+    /// the reply nor newer writing that holds the turn open. Its interrupted
+    /// marker must not be read as this turn's ending either.
+    #[test]
+    fn a_hidden_regenerated_tail_is_not_part_of_the_conversation() {
+        let t = record(
+            serde_json::json!([
+                assistant("h1", "## 5. 확장성\n\nthe regenerated tail", serde_json::json!({
+                    "hidden": true, "finish": "interrupted",
+                })),
+                assistant("a1", "## 1. 결론\n\nthe visible complete answer", serde_json::json!({})),
+            ]),
+            "q",
+        );
+        assert!(matches!(
+            judge_record(&t),
+            Verdict::Done(a) if a.text == "## 1. 결론\n\nthe visible complete answer"
+        ));
+    }
+
+    /// A regenerated or superseded final message is not part of the reply. The
+    /// newest one is. Joining them would also glue an artifact to the text and
+    /// break a ```json fence the schema validator needs.
+    #[test]
+    fn only_the_newest_final_message_is_the_reply() {
+        let t = record(
+            serde_json::json!([
+                assistant("a2", "the newer answer", serde_json::json!({})),
+                assistant("a1", "the older answer", serde_json::json!({})),
+            ]),
+            "q",
+        );
+        assert!(matches!(judge_record(&t), Verdict::Done(a) if a.text == "the newer answer"));
     }
 
     #[test]
-    fn the_record_walk_stops_at_this_turns_prompt() {
+    fn an_empty_final_message_is_not_a_reply() {
+        let t = record(
+            serde_json::json!([assistant("a1", "   ", serde_json::json!({}))]),
+            "q",
+        );
+        assert_eq!(judge_record(&t), Verdict::Open);
+    }
+
+    /// A failed read or a payload without the projection is "no proof", never
+    /// an answer and never a hard failure.
+    #[test]
+    fn an_unreadable_record_is_no_proof() {
+        assert!(RecordTurn::from_json(&serde_json::json!({
+            "ok": false, "error": "HTTP 500",
+        }))
+        .is_none());
+        assert!(RecordTurn::from_json(&serde_json::json!({"ok": true})).is_none());
+    }
+
+    /// The guard as a table: none of these shapes may be reported as a
+    /// finished reply, whatever their own flags say. This is the invariant the
+    /// bug broke, so it is asserted once over every non-final shape we know.
+    #[test]
+    fn no_non_final_shape_is_ever_done() {
+        let shapes: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "commentary leaf",
+                serde_json::json!([assistant("a1", "step", serde_json::json!({
+                    "channel": "commentary",
+                }))]),
+            ),
+            (
+                "analysis leaf",
+                serde_json::json!([assistant("a1", "analysis", serde_json::json!({
+                    "channel": "analysis",
+                }))]),
+            ),
+            (
+                "thoughts above the answer",
+                serde_json::json!([
+                    {"id":"t","role":"assistant","content_type":"thoughts",
+                     "status":"finished_successfully","weight":1,"text":""},
+                    assistant("a1", "answer", serde_json::json!({})),
+                ]),
+            ),
+            (
+                "message in progress",
+                serde_json::json!([assistant("a1", "half", serde_json::json!({
+                    "status": "in_progress",
+                }))]),
+            ),
+            (
+                "node in progress",
+                serde_json::json!([assistant("a1", "half", serde_json::json!({
+                    "node_status": "in_progress",
+                }))]),
+            ),
+            (
+                "end_turn false",
+                serde_json::json!([assistant("a1", "half", serde_json::json!({
+                    "end_turn": false,
+                }))]),
+            ),
+            (
+                "not complete",
+                serde_json::json!([assistant("a1", "half", serde_json::json!({
+                    "is_complete": false,
+                }))]),
+            ),
+            (
+                "failed status",
+                serde_json::json!([assistant("a1", "answer", serde_json::json!({
+                    "status": "failed",
+                }))]),
+            ),
+            (
+                "empty text",
+                serde_json::json!([assistant("a1", "   ", serde_json::json!({}))]),
+            ),
+            (
+                "hidden answer",
+                serde_json::json!([assistant("a1", "hidden", serde_json::json!({
+                    "hidden": true,
+                }))]),
+            ),
+            (
+                "weight zero",
+                serde_json::json!([assistant("a1", "weightless", serde_json::json!({
+                    "weight": 0,
+                }))]),
+            ),
+            (
+                "tool recipient",
+                serde_json::json!([assistant("a1", "tool output", serde_json::json!({
+                    "recipient": "web.run",
+                }))]),
+            ),
+            ("no nodes at all", serde_json::json!([])),
+        ];
+        for (name, nodes) in shapes {
+            let t = record(nodes, "q");
+            assert_eq!(judge_record(&t), Verdict::Open, "{name}");
+        }
+    }
+
+    /// The exact string that reached a `completed` envelope.
+    #[test]
+    fn the_chrome_header_alone_is_not_a_reply() {
+        assert_eq!(usable_reply("ChatGPT 답변:ChatGPT", ""), None);
+        assert_eq!(usable_reply("ChatGPT said:", ""), None);
+        assert_eq!(usable_reply("   ", ""), None);
+        assert_eq!(
+            usable_reply("ChatGPT 답변: 실제 답변", ""),
+            Some("실제 답변".into())
+        );
+        // Prose that starts with a label word is not a header.
+        assert_eq!(
+            usable_reply("You can do this.", ""),
+            Some("You can do this.".into())
+        );
+        assert_eq!(usable_reply("OK", ""), Some("OK".into()));
+    }
+
+    #[test]
+    fn the_tab_title_is_not_a_reply() {
+        assert_eq!(usable_reply("Fix the parser", "Fix the parser"), None);
+    }
+
+    #[test]
+    fn the_record_must_describe_this_turn() {
+        let t = record(serde_json::json!([assistant("a1", "done", serde_json::json!({}))]), "our prompt");
+        assert!(record_is_ours(&t, Some("c1"), Some("our prompt"), false));
+        assert!(!record_is_ours(&t, Some("c2"), Some("our prompt"), false), "wrong conversation");
+        assert!(!record_is_ours(&t, Some("c1"), Some("another prompt"), false), "wrong prompt");
+
+        // A connector pill is prepended to the submitted text.
+        let with_pill = record(
+            serde_json::json!([assistant("a1", "done", serde_json::json!({}))]),
+            "@app our prompt",
+        );
+        assert!(record_is_ours(&with_pill, Some("c1"), Some("our prompt"), true));
+        // Resume attaches without a prompt; the id is the only identity it has.
+        assert!(record_is_ours(&t, Some("c1"), None, false));
+    }
+
+    #[test]
+    fn a_long_prompt_is_identified_by_its_opening() {
+        let long = format!("{} tail", "a".repeat(300));
+        assert!(same_prompt(&long, &format!("{} tail truncated", "a".repeat(300)), false));
+        assert!(!same_prompt(&long, &format!("{} tail", "b".repeat(300)), false));
+    }
+
+    #[test]
+    fn a_settled_page_asks_the_record_and_never_answers_itself() {
+        let now = Instant::now();
+        let mut w = Watch::new(&SendOptions::default(), now);
+        let dom = DomProgress {
+            stop: false,
+            tool_active: false,
+            new_turn: true,
+            text: "step one",
+        };
+
+        // First poll: the record is asked, and the page is not yet settled.
+        assert!(w.observe(dom, now));
+        assert!(!w.settled());
+        w.record_open(now);
+        // The gate holds the next ask back; the same text now counts as stable.
+        assert!(!w.observe(dom, now + Duration::from_secs(1)));
+        assert!(!w.observe(dom, now + Duration::from_secs(2)));
+        assert!(w.settled(), "two unchanged polls with no stop button");
+        // A readable "still open" answer spends the settle evidence.
+        assert!(w.observe(dom, now + Duration::from_secs(21)));
+        w.record_open(now + Duration::from_secs(21));
+        assert!(!w.settled());
+    }
+
+    #[test]
+    fn a_streaming_page_resets_the_settle_evidence() {
+        let now = Instant::now();
+        let mut w = Watch::new(&SendOptions::default(), now);
+        let still = DomProgress {
+            stop: false,
+            tool_active: false,
+            new_turn: true,
+            text: "same",
+        };
+        w.observe(still, now);
+        w.observe(still, now + Duration::from_secs(2));
+        w.observe(still, now + Duration::from_secs(4));
+        assert!(w.settled());
+        // The stop button reappears: generation resumed, so the evidence is gone.
+        w.observe(
+            DomProgress { stop: true, ..still },
+            now + Duration::from_secs(6),
+        );
+        assert!(!w.settled());
+    }
+
+    #[test]
+    fn an_unreadable_record_backs_off_to_a_ceiling() {
+        let now = Instant::now();
+        let mut w = Watch::new(&SendOptions::default(), now);
+        let mut at = now;
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            w.record_unreadable(at);
+            waits.push((w.next_record - at).as_secs());
+            at = w.next_record;
+        }
+        assert_eq!(waits, vec![2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn the_record_probe_projects_what_the_judge_needs() {
         let js = js_server_final("c-1");
-        assert!(js.contains("m.author.role === 'user') break"), "must not reach the previous turn");
-        assert!(js.contains("finish_details"));
+        for field in [
+            "channel",
+            "end_turn",
+            "status",
+            "node_status",
+            "is_complete",
+            "recipient",
+            "user_text",
+            "finish_details",
+        ] {
+            assert!(js.contains(field), "{field} missing from the probe");
+        }
+        assert!(
+            js.contains("m.author.role === 'user')"),
+            "must not reach the previous turn"
+        );
+    }
+
+    #[test]
+    fn the_page_state_carries_the_title_for_placeholder_checks() {
+        assert!(JS_STATE.contains("title: (document.title"), "{JS_STATE}");
     }
 
     #[test]
