@@ -178,7 +178,7 @@ pub struct ChannelArgs {
     #[arg(long)]
     pub session: Option<String>,
     /// File the conversation under a ChatGPT Project (empty = plain chat).
-    #[arg(long, default_value = "chatgpt-use")]
+    #[arg(long, default_value = "")]
     pub project: String,
     /// Total wall-clock budget per model turn, in seconds.
     #[arg(long, default_value_t = 300)]
